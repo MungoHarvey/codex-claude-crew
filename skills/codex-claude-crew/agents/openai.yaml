@@ -1,0 +1,8 @@
+interface:
+  display_name: "Claude Crew"
+  short_description: "Hand bounded tasks to a local Claude Code session and verify the result"
+  default_prompt: "Use $codex-claude-crew to have Claude Code review my current changes, then check its findings yourself."
+  # icon_small, icon_large and brand_color come later, with icons in ../assets/.
+
+policy:
+  allow_implicit_invocation: true
