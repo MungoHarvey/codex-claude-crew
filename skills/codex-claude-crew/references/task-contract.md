@@ -9,7 +9,7 @@ Claude starts with none of the Codex conversation. Write the brief for a capable
 | Section | What to write |
 |---|---|
 | Goal | The outcome, in one or two sentences. |
-| Context | Repo and branch. Files and docs to read first, by path. Rules from `AGENTS.md` that matter (Claude reads `CLAUDE.md` itself, but not `AGENTS.md`). What you already know or ruled out. |
+| Context | Repo and branch. Files and docs to read first, by path. Applicable `AGENTS.md` and `CLAUDE.md` rules; restricted mode does not load them automatically. What you already know or ruled out. |
 | Scope | Paths to change (implement) or focus on (review). What's off-limits. |
 | Acceptance criteria | Statements Codex can check afterwards. |
 | Checks | Exact commands. Each one needs a matching `--allow` rule, or Claude's attempt is denied. |
@@ -63,16 +63,20 @@ The relay passes a JSON schema with `--json-schema`, so Claude's final answer co
 | Field | Meaning |
 |---|---|
 | `run_id`, `mode`, `cwd` | The run, its mode and the folder Claude worked in |
-| `status` | How the Claude process ended: `completed`, `error`, `timed_out`, `interrupted` or `claude_unavailable`. While active, `queued` or `running` |
+| `status` | `completed` requires process success and a valid report. Terminal failures: `error`, `timed_out`, `interrupted`, `claude_unavailable`. Active/reserved: `queued`, `running`, `stopping`, `orphaned` (stop unconfirmed) |
 | `worktree` | Implement runs: `repo`, `path`, `branch` and the `base` commit |
-| `request` | What was asked for: model, effort, limits, `--allow` rules, `resume_from` |
-| `claude` | `session_id`, `version`, `subtype`, `num_turns`, `cost_usd` (an estimate), `models` used, `permission_denials`, `errors`, `result_text` and the `transcript` path |
+| `request` | Effective model, effort, per-invocation limits, `--allow` rules, `resume_from`, and explicit `overrides`. Omitted options inherit on resume |
+| `claude` | Session/version, process outcome, turns, models, denials, errors, result text and transcript. `session_cost_usd` is the estimated conversation total; `cost_usd` is its compatibility alias. `cost_delta_usd` is the difference from the latest completed predecessor when known, otherwise null |
 | `claimed` | Claude's report (above), or `null` if it didn't return one |
 | `observed` | What the relay saw in git: `changed_files`, `commits` added, and `read_only_violation` for review runs |
 | `verification` | Codex's verdict. It stays `pending` until `relay.py verify` records `confirmed`, `partial` or `rejected` with the checks Codex ran |
 | `notes`, `error` | Warnings, and the failure reason if there was one |
+| `report_error` | Missing or invalid structured-report details; `claimed` is null when validation fails |
+| `worker`, `child` | Recorded PID, process-group and start identity used for cancellation and crash recovery |
 
-`status: completed` only means Claude finished and returned a result. Whether the task is done is in `claimed.status` (Claude's view) and `verification.verdict` (Codex's).
+`status: completed` means Claude finished successfully with a valid report. Whether the task is done is in `claimed.status` (Claude's view) and `verification.verdict` (Codex's). An `orphaned` run keeps its session/worktree reservation until status can confirm that the recorded process group has stopped.
+
+Never sum session cost totals across resumes. Deltas are client estimates relative to the recorded baseline; manual activity in the same Claude session can contribute to them. Forks, missing baselines, stale predecessors and decreasing totals produce null deltas. `--max-budget-usd` applies to each invocation, including a resumed invocation, not to the entire task.
 
 ## Verification
 

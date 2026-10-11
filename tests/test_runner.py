@@ -17,7 +17,7 @@ RELAY = ROOT / "skills" / "codex-claude-crew" / "scripts" / "relay.py"
 FAKE_CLAUDE = ROOT / "tests" / "fixtures" / "fake_claude.py"
 
 
-class RelayTests(unittest.TestCase):
+class RelayHarness(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -61,11 +61,13 @@ class RelayTests(unittest.TestCase):
     def flag(argv, name):
         return argv[argv.index(name) + 1]
 
+
+class RelayTests(RelayHarness):
     def test_preflight_reports_version_and_hides_account_details(self):
         code, report = self.relay("preflight")
         self.assertEqual(code, 0, report)
         self.assertTrue(report["ok"])
-        self.assertEqual(report["version"], "2.1.201")
+        self.assertEqual(report["version"], "2.1.300")
         self.assertIs(report["auth"]["loggedIn"], True)
         self.assertNotIn("someone@example.com", json.dumps(report))
 
@@ -77,7 +79,7 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(call["stdin"], "Review README.md for typos.")
         self.assertEqual(self.flag(call["argv"], "--permission-mode"), "dontAsk")
         self.assertNotIn("Edit", self.flag(call["argv"], "--tools").split(","))
-        self.assertNotIn("--permission-prompts", call["argv"])
+        self.assertEqual(self.flag(call["argv"], "--permission-prompts"), "none")
         self.assertEqual(record["claude"]["session_id"], self.flag(call["argv"], "--session-id"))
         self.assertEqual(record["claude"]["models"], ["claude-sonnet-5-5"])
         self.assertEqual(record["claude"]["permission_denials"], [{"tool": "Bash", "input": "npm install"}])
@@ -103,7 +105,7 @@ class RelayTests(unittest.TestCase):
         call = self.calls()[0]
         self.assertEqual(Path(call["cwd"]).resolve(), Path(worktree["path"]).resolve())
         self.assertEqual(self.flag(call["argv"], "--permission-mode"), "acceptEdits")
-        self.assertIn("Bash(pytest *)", self.flag(call["argv"], "--allowedTools"))
+        self.assertIn("Bash(pytest *)", call["argv"])
         self.assertEqual(record["observed"]["changed_files"], ["crew-was-here.txt"])
         self.assertEqual(record["observed"]["commits"], [])
         self.assertFalse((self.repo / "crew-was-here.txt").exists())
@@ -192,7 +194,7 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(runs[0]["run_id"], record["run_id"])
         self.assertEqual(runs[0]["session_id"], done["claude"]["session_id"])
 
-    def test_permission_prompts_flag_only_on_new_enough_claude(self):
+    def test_permission_prompts_are_disabled_on_supported_claude(self):
         self.relay("run", "--mode", "review", "--brief", "-", FAKE_CLAUDE_VERSION="2.1.300")
         self.assertEqual(self.flag(self.calls()[0]["argv"], "--permission-prompts"), "none")
 

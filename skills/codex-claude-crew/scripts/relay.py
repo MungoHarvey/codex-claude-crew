@@ -22,8 +22,10 @@ CLAUDE_CREW_BIN (path to the claude executable, default: found on PATH).
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -32,18 +34,25 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 RECORD_SCHEMA = "codex-claude-crew.run/v1"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 VERDICTS = ("confirmed", "partial", "rejected")
-ACTIVE = ("queued", "running")
+ACTIVE = ("queued", "running", "stopping", "orphaned")
 STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
-# First Claude Code release with `--permission-prompts none`.
-PERMISSION_PROMPTS_SINCE = (2, 1, 259)
+# Require both restricted mode and unattended permission denial; no weaker fallback.
+MIN_CLAUDE_VERSION = (2, 1, 259)
+PROFILE_FLAGS = ["--restricted", "--permission-prompts", "none", "--no-chrome",
+                 "--disable-slash-commands", "--strict-mcp-config",
+                 "--mcp-config", '{"mcpServers":{}}']
+DEFAULT_REQUEST = {"model": None, "effort": None, "max_turns": 50,
+                   "max_budget_usd": None, "timeout_s": 1800, "allow": []}
 
 READ_TOOLS = ["Read", "Glob", "Grep"]
 EXTRA_TOOLS = ("Bash", "WebFetch", "WebSearch")  # what --allow may add
@@ -144,7 +153,7 @@ def emit(payload, code=0):
 
 
 def crew_home():
-    return Path(os.environ.get("CLAUDE_CREW_HOME") or Path.home() / ".codex-claude-crew")
+    return Path(os.environ.get("CLAUDE_CREW_HOME") or Path.home() / ".codex-claude-crew").expanduser().resolve()
 
 
 def runs_dir():
@@ -157,7 +166,8 @@ def runs_dir():
 def claude_bin():
     configured = os.environ.get("CLAUDE_CREW_BIN")
     if configured:
-        return configured if os.path.isfile(configured) and os.access(configured, os.X_OK) else None
+        path = Path(configured).expanduser().resolve()
+        return str(path) if path.is_file() and os.access(path, os.X_OK) else None
     return shutil.which("claude")
 
 
@@ -172,6 +182,25 @@ def claude_version(binary):
 
 def version_tuple(version):
     return tuple(int(part) for part in version.split(".")) if version else ()
+
+
+def capabilities(binary):
+    """Probe parser support without a model call. Help alone can omit valid flags."""
+    version = claude_version(binary)
+    supported = version_tuple(version) >= MIN_CLAUDE_VERSION
+    flags_ok = False
+    if supported:
+        try:
+            proc = subprocess.run(
+                [binary, *PROFILE_FLAGS, "--max-turns", "1", "--json-schema", "{}", "--help"],
+                capture_output=True, text=True, timeout=30,
+            )
+            flags_ok = proc.returncode == 0 and not re.search(
+                r"unknown option|unexpected option|unrecognized", proc.stderr, re.I)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return {"version": version, "minimum_version": ".".join(map(str, MIN_CLAUDE_VERSION)),
+            "version_supported": supported, "restricted_profile": bool(flags_ok)}
 
 
 def claude_args(record, version):
@@ -196,9 +225,9 @@ def claude_args(record, version):
         "--append-system-prompt", f"{WORKER_RULES}\n\n{MODE_RULES[mode]}",
         "--permission-mode", permission_mode,
         "--tools", ",".join(tools),
-        "--allowedTools", ",".join(allowed + request["allow"]),
+        "--allowedTools", *allowed, *request["allow"],
         "--disallowedTools", ",".join(DENY_RULES),
-        "--strict-mcp-config",  # with no --mcp-config: no MCP servers
+        *PROFILE_FLAGS,
         "--max-turns", str(request["max_turns"]),
     ]
     if request["max_budget_usd"] is not None:
@@ -214,8 +243,6 @@ def claude_args(record, version):
     else:
         # Choosing the id up front means a run that times out can still be resumed.
         args += ["--session-id", record["claude"]["session_id"]]
-    if version_tuple(version) >= PERMISSION_PROMPTS_SINCE:
-        args += ["--permission-prompts", "none"]
     return args
 
 
@@ -236,9 +263,9 @@ def git(cwd, *args, check=True):
     try:
         proc = subprocess.run(
             ["git", "-C", str(cwd), *args],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", timeout=60,
         )
-    except OSError as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         raise Fail(f"could not run git: {exc}", code=1, status="error")
     if check and proc.returncode != 0:
         raise Fail(f"git {' '.join(args)} failed: {proc.stderr.strip()}", code=1, status="error")
@@ -267,16 +294,40 @@ def git_status(root):
 
 
 def fingerprint(root):
-    """Working-tree snapshot for the read-only tripwire. Sees git-visible changes only."""
-    status = git_status(root)
-    digest = hashlib.sha256(git(root, "diff", "HEAD", "--binary", check=False).encode("utf-8", "replace"))
-    for path, code in sorted(status.items()):
-        if code == "??":
-            try:
-                digest.update(f"{path}:{os.stat(root / path).st_mtime_ns}".encode())
-            except OSError:
-                pass
-    return status, digest.hexdigest()
+    """Snapshot HEAD, index and contents of Git-visible paths, including clean files.
+
+    Ignored files and changes outside this repository are deliberately out of scope.
+    A submodule or unreadable path makes coverage incomplete, never 'unchanged'.
+    """
+    result = {"head": git(root, "rev-parse", "--verify", "HEAD", check=False).strip(),
+              "ref": git(root, "symbolic-ref", "-q", "HEAD", check=False).strip(),
+              "status": git_status(root), "paths": {}, "index": {}, "complete": True}
+    for entry in git(root, "ls-files", "--stage", "-z").split("\0"):
+        if entry:
+            metadata, path = entry.split("\t", 1)
+            result["index"].setdefault(path, []).append(metadata)
+    paths = set(result["index"]) | set(result["status"])
+    for path in sorted(paths):
+        target = root / path
+        try:
+            if target.is_symlink():
+                value = "symlink:" + os.readlink(target)
+            elif target.is_file():
+                digest = hashlib.sha256()
+                with target.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                value = f"{target.stat().st_mode & 0o777}:{digest.hexdigest()}"
+            elif not target.exists():
+                value = "missing"
+            else:
+                value = None
+                result["complete"] = False
+            result["paths"][path] = value
+        except OSError:
+            result["paths"][path] = None
+            result["complete"] = False
+    return result
 
 
 def create_worktree(cwd, name, base):
@@ -304,15 +355,34 @@ def create_worktree(cwd, name, base):
 # --- run records -----------------------------------------------------------------
 
 
+@contextmanager
+def state_lock():
+    """Serialize short state transactions across CLI processes (macOS/Linux)."""
+    crew_home().mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(crew_home() / ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def record_path(run_id):
     return runs_dir() / run_id / "run.json"
 
 
 def save(record):
+    """Atomic replacement. Callers serialize read/modify/write with state_lock."""
     path = record_path(record["run_id"])
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(record, indent=2))
-    os.replace(tmp, path)
+    fd, temporary = tempfile.mkstemp(prefix="run-", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(record, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def load(run_id):
@@ -348,33 +418,108 @@ def require_run(ref):
     return record
 
 
-def alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+def process_table():
+    """Read process identities without command lines or environment values."""
+    proc = subprocess.run(["ps", "-axo", "pid=,pgid=,stat=,lstart="],
+                          capture_output=True, text=True, timeout=10,
+                          env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+    if proc.returncode:
+        raise Fail("could not inspect processes; execution state is unconfirmed", 1, "error")
+    rows = {}
+    for line in proc.stdout.splitlines():
+        fields = line.split(None, 3)
+        if len(fields) == 4 and "Z" not in fields[2]:
+            rows[int(fields[0])] = {"pid": int(fields[0]), "pgid": int(fields[1]),
+                                    "started": " ".join(fields[3].split())}
+    return rows
+
+
+def process_identity(pid):
+    return process_table().get(pid)
+
+
+def same_process(identity, table=None):
+    if not identity:
         return False
-    except PermissionError:
+    actual = (process_table() if table is None else table).get(identity["pid"])
+    return actual is not None and actual["started"] == identity["started"]
+
+
+def group_members(pgid):
+    return {pid: row for pid, row in process_table().items() if row["pgid"] == pgid}
+
+
+def stop_group(identity, proc=None, owned=False):
+    """Stop the entire group, even after its leader exits.
+
+    During recovery, refuse to signal a reused PID or an unidentifiable orphan
+    group. Such jobs retain their reservation and require manual inspection.
+    """
+    if not identity:
+        return False
+    pgid = identity["pid"]
+    members = group_members(pgid)
+    if not members:
         return True
-    return True
+    leader = process_table().get(pgid)
+    if leader and not same_process(identity, {pgid: leader}):
+        return False
+    if not leader and not owned:
+        return False
+    for sig, grace in ((signal.SIGINT, 5), (signal.SIGTERM, 3), (signal.SIGKILL, 2)):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            if proc is not None:
+                proc.poll()  # reap the leader; zombies cannot do any more work
+            if not group_members(pgid):
+                return True
+            time.sleep(0.1)
+    return not group_members(pgid)
 
 
 def refresh(record):
-    """Reload a record, and close it out if the process running it died without finishing."""
-    record = load(record["run_id"])
-    pid = record.get("worker_pid")
-    if record["status"] in ACTIVE and pid and not alive(pid):
-        record = load(record["run_id"])  # it may have finished between the two reads
-        if record["status"] in ACTIVE:
-            return finish(record, "error", "the relay stopped before the run finished; see claude.stderr.log, or resume the session")
-    return record
+    """Reconcile lost workers; never release a live or unconfirmed execution."""
+    with state_lock():
+        record = load(record["run_id"])
+        if record["status"] not in ACTIVE:
+            return record
+        table = process_table()
+        if same_process(record.get("worker"), table):
+            return record
+        if record["status"] == "queued" and same_process(record.get("launcher"), table):
+            return record
+        if same_process(record.get("recovery_owner"), table):
+            return record
+        record.update(status="stopping", recovery_owner=process_identity(os.getpid()))
+        save(record)
+    child = record.get("child")
+    # With the gated launch protocol an unrecorded child cannot start Claude.
+    stopped = stop_group(child) if child else record.get("gated_launch", False)
+    if stopped:
+        baseline = record.get("baseline") or {}
+        observe(record, Path(record["git_root"]) if record.get("git_root") else None, baseline)
+        return finish(record, "error", "the relay worker was lost; execution has stopped")
+    return finish(record, "orphaned", "worker lost; execution could not be confirmed stopped; inspect the recorded process group")
 
 
 def finish(record, status, error):
     session_id = record["claude"]["session_id"]
     if session_id:
         record["claude"]["transcript"] = transcript_path(record["cwd"], session_id)
-    record.update(status=status, error=error, finished_at=now())
-    save(record)
+    record.update(status=status, error=error,
+                  finished_at=None if status in ACTIVE else now(), recovery_owner=None)
+    with state_lock():
+        current = load(record["run_id"])
+        # A late writer must not resurrect or overwrite a terminal record.
+        if current["status"] not in ACTIVE:
+            return current
+        save(record)
     return record
 
 
@@ -385,21 +530,6 @@ def _interrupt(signum, frame):
     for sig in STOP_SIGNALS:
         signal.signal(sig, signal.SIG_IGN)
     raise Interrupted()
-
-
-def stop(proc):
-    """Ask Claude to end its turn (SIGINT), then escalate. Signals go to Claude's whole process group."""
-    for sig, grace in ((signal.SIGINT, 15), (signal.SIGTERM, 5), (signal.SIGKILL, 5)):
-        if proc.poll() is not None:
-            return
-        try:
-            os.killpg(proc.pid, sig)
-        except OSError:
-            return
-        try:
-            proc.wait(timeout=grace)
-        except subprocess.TimeoutExpired:
-            pass
 
 
 def parse_result(stdout):
@@ -423,6 +553,33 @@ def denial(item):
     return {"tool": item.get("tool_name"), "input": str(detail)[:300]}
 
 
+def validate_report(value, schema=REPORT_SCHEMA, path="report"):
+    """Validate the JSON Schema subset used by REPORT_SCHEMA, without dependencies."""
+    kind = schema["type"]
+    valid = {"object": isinstance(value, dict), "array": isinstance(value, list),
+             "string": isinstance(value, str), "integer": type(value) is int}[kind]
+    if not valid:
+        return f"{path} must be {kind}"
+    if "enum" in schema and value not in schema["enum"]:
+        return f"{path} has an invalid value"
+    if kind == "object":
+        properties = schema["properties"]
+        if set(schema.get("required", [])) - set(value):
+            return f"{path} is missing required fields"
+        if schema.get("additionalProperties") is False and set(value) - set(properties):
+            return f"{path} contains unexpected fields"
+        for key, item in value.items():
+            error = validate_report(item, properties[key], f"{path}.{key}")
+            if error:
+                return error
+    elif kind == "array":
+        for index, item in enumerate(value):
+            error = validate_report(item, schema["items"], f"{path}[{index}]")
+            if error:
+                return error
+    return None
+
+
 def read_result(record, stdout, stderr, status, error):
     claude = record["claude"]
     result = parse_result(stdout)
@@ -441,14 +598,24 @@ def read_result(record, stdout, stderr, status, error):
         is_error=bool(result.get("is_error")),
         num_turns=result.get("num_turns"),
         duration_ms=result.get("duration_ms"),
-        cost_usd=result.get("total_cost_usd"),
-        models=sorted(result.get("modelUsage") or {}),
-        permission_denials=[denial(item) for item in result.get("permission_denials") or []],
-        errors=[str(item) for item in result.get("errors") or []],
-        result_text=result.get("result"),
+        models=sorted(result.get("modelUsage")) if isinstance(result.get("modelUsage"), dict) else [],
+        permission_denials=[denial(item) for item in (result.get("permission_denials") or []) if isinstance(item, dict)]
+            if isinstance(result.get("permission_denials", []), list) else [],
+        errors=[str(item) for item in (result.get("errors") or [])]
+            if isinstance(result.get("errors", []), list) else [],
+        result_text=result.get("result") if isinstance(result.get("result"), str) else None,
     )
+    cost = result.get("total_cost_usd")
+    cost = cost if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0 else None
+    claude["cost_usd"] = claude["session_cost_usd"] = cost  # old field retained as an alias
+    prior = record.get("cost_baseline_usd")
+    if type(prior) not in (int, float) or not math.isfinite(prior) or prior < 0:
+        prior = None
+    claude["cost_delta_usd"] = round(cost - prior, 10) if cost is not None and prior is not None and cost >= prior else None
     claimed = result.get("structured_output")
-    record["claimed"] = claimed if isinstance(claimed, dict) else None
+    report_error = validate_report(claimed)
+    record["report_error"] = report_error
+    record["claimed"] = claimed if report_error is None else None
     if status == "completed" and (claude["is_error"] or claude["subtype"] != "success" or claude["exit_code"] != 0):
         status = "error"
         error = (
@@ -456,6 +623,8 @@ def read_result(record, stdout, stderr, status, error):
             or (claude["result_text"] or "")[:500]
             or f"Claude Code ended with {claude['subtype']} (exit code {claude['exit_code']})"
         )
+    if status == "completed" and report_error:
+        status, error = "error", f"Claude returned an invalid or missing structured report: {report_error}"
     return status, error
 
 
@@ -465,9 +634,22 @@ def observe(record, root, before):
     try:
         if record["mode"] == "review" and root and before:
             after = fingerprint(root)
-            observed["read_only_violation"] = after != before
-            paths = set(before[0]) | set(after[0])
-            observed["changed_files"] = sorted(p for p in paths if before[0].get(p) != after[0].get(p))
+            paths = set(before["paths"]) | set(after["paths"])
+            changed = {p for p in paths if
+                       (before["paths"].get(p) is not None and after["paths"].get(p) is not None and
+                        before["paths"][p] != after["paths"][p]) or
+                       before["index"].get(p) != after["index"].get(p) or
+                       before["status"].get(p) != after["status"].get(p)}
+            head_changed = before["head"] != after["head"] or before["ref"] != after["ref"]
+            observed.update(head_before=before["head"], head_after=after["head"],
+                            head_changed=head_changed, coverage_complete=before["complete"] and after["complete"])
+            observed["changed_files"] = sorted(changed)
+            observed["read_only_violation"] = True if changed or head_changed else (
+                False if observed["coverage_complete"] else None)
+            if before["head"] and after["head"]:
+                observed["commits"] = git(root, "log", "--format=%h %s", f"{before['head']}..{after['head']}").splitlines()
+            elif after["head"]:
+                observed["commits"] = git(root, "log", "--format=%h %s", after["head"]).splitlines()
         elif record["mode"] == "implement" and record["worktree"]:
             path, base = record["worktree"]["path"], record["worktree"]["base"]
             committed = git(path, "diff", "--name-only", "-z", base, "HEAD").split("\0")
@@ -478,57 +660,108 @@ def observe(record, root, before):
 
 
 def execute(record):
-    """Run Claude for a saved record and fill in the result. Used by foreground runs and _worker."""
-    record["worker_pid"] = os.getpid()
+    """Own a queued reservation, run Claude, and retain it until its group stops."""
+    with state_lock():
+        record = load(record["run_id"])
+        if record["status"] != "queued":
+            return record
+        if record.get("worker") and record["worker"]["pid"] != os.getpid():
+            raise Fail("this run already belongs to another worker")
+        record.update(worker_pid=os.getpid(), worker=process_identity(os.getpid()))
+        if record["worker"] is None:
+            raise Fail("could not establish worker process identity", 1, "error")
+        save(record)  # before probing the CLI or reading the repository
+
     files = record["files"]
-    binary = claude_bin()
-    if not binary:
-        return finish(record, "claude_unavailable", "claude not found; install Claude Code or set CLAUDE_CREW_BIN")
-    version = claude_version(binary)
-    record["claude"]["version"] = version
-    argv = [binary, *claude_args(record, version)]
-    Path(files["run_dir"], "command.json").write_text(json.dumps(argv, indent=2))
-
+    proc, child = None, None
     root, before = None, None
-    if record["mode"] == "review":
-        root = git_root(record["cwd"])
-        try:
-            before = fingerprint(root) if root else None
-        except Fail:
-            root = None
-    record.update(status="running", started_at=now())
-    save(record)
-
     status, error = "completed", None
-    timeout = record["request"]["timeout_s"]
-    with open(files["stdout"], "wb") as out, open(files["stderr"], "wb") as err:
-        try:
-            proc = subprocess.Popen(
-                argv, cwd=record["cwd"], stdin=subprocess.PIPE, stdout=out, stderr=err,
-                start_new_session=True,  # own process group, so stop() reaches Claude's children too
-            )
-        except OSError as exc:
-            return finish(record, "claude_unavailable", f"could not start claude: {exc}")
-        handlers = {sig: signal.signal(sig, _interrupt) for sig in STOP_SIGNALS}
-        try:
+    handlers = {sig: signal.signal(sig, _interrupt) for sig in STOP_SIGNALS}
+    try:
+        binary = claude_bin()
+        if not binary:
+            raise Fail("claude not found; install Claude Code or set CLAUDE_CREW_BIN", 127, "claude_unavailable")
+        caps = capabilities(binary)
+        record["claude"]["version"] = caps["version"]
+        if not caps["restricted_profile"]:
+            raise Fail(f"Claude Code {caps['minimum_version']}+ with the restricted profile is required; run claude update", 1, "error")
+        argv = [binary, *claude_args(record, caps["version"])]
+        Path(files["run_dir"], "command.json").write_text(json.dumps(argv, indent=2))
+        if record["mode"] == "review":
+            root = git_root(record["cwd"])
             try:
-                proc.communicate(Path(files["brief"]).read_bytes(), timeout=timeout)
+                before = fingerprint(root) if root else None
+            except Fail as exc:
+                record["notes"].append(f"Read-only snapshot unavailable: {exc}")
+            if before is None:
+                record["notes"].append("Read-only tripwire coverage is unavailable; inspect files independently.")
+        record.update(status="running", started_at=now(), baseline=before,
+                      git_root=str(root) if root else None)
+        with state_lock():
+            save(record)
+        with open(files["stdout"], "wb") as out, open(files["stderr"], "wb") as err:
+            # The wrapper cannot exec Claude until we save its process identity
+            # and release its stdin gate. A SIGKILL before that closes the pipe.
+            mask = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, str(Path(__file__).resolve()), "_exec", record["run_id"]],
+                    cwd=record["cwd"], stdin=subprocess.PIPE, stdout=out, stderr=err,
+                    start_new_session=True,
+                )
+                child = process_identity(proc.pid)
+                if not child:
+                    raise Fail("could not identify the gated Claude process", 1, "error")
+                record["child"] = child
+                with state_lock():
+                    save(record)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+            try:
+                proc.communicate(b"G" + Path(files["brief"]).read_bytes(), timeout=record["request"]["timeout_s"])
             except subprocess.TimeoutExpired:
-                status, error = "timed_out", f"Claude didn't finish within {timeout}s"
-                stop(proc)
-        except Interrupted:
-            status, error = "interrupted", "the relay was stopped before Claude finished"
-            stop(proc)
+                status, error = "timed_out", f"Claude didn't finish within {record['request']['timeout_s']}s"
+    except Interrupted:
+        status, error = "interrupted", "the relay was stopped before Claude finished"
+    except (Fail, OSError, ValueError, subprocess.SubprocessError) as exc:
+        status, error = getattr(exc, "status", "error"), str(exc)
+    finally:
+        # Cleanup itself must not be interrupted halfway through the escalation.
+        for sig in STOP_SIGNALS:
+            signal.signal(sig, signal.SIG_IGN)
+        try:
+            if proc is not None:
+                child = child or process_identity(proc.pid)
+                stopped = stop_group(child, proc=proc, owned=True) if child else proc.poll() is not None
+                if not stopped:
+                    status, error = "orphaned", "execution could not be confirmed stopped; inspect the recorded process group"
+                if proc.stdin:
+                    proc.stdin.close()
+                proc.poll()
+                record["claude"]["exit_code"] = proc.returncode
+        except (Fail, OSError, subprocess.SubprocessError) as exc:
+            status, error = "orphaned", f"could not confirm process cleanup: {exc}"
         finally:
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
 
-    record["claude"]["exit_code"] = proc.returncode
-    stdout = Path(files["stdout"]).read_text(errors="replace")
-    stderr = Path(files["stderr"]).read_text(errors="replace")
+    stdout = Path(files["stdout"]).read_text(errors="replace") if Path(files["stdout"]).exists() else ""
+    stderr = Path(files["stderr"]).read_text(errors="replace") if Path(files["stderr"]).exists() else ""
     status, error = read_result(record, stdout, stderr, status, error)
     observe(record, root, before)
     return finish(record, status, error)
+
+
+def cmd_exec(args):
+    """Internal gated exec: no model starts unless the owner persisted our identity."""
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+    if os.read(sys.stdin.fileno(), 1) != b"G":
+        return 1
+    record = require_run(args.run_id)
+    if not same_process(record.get("child")) or record["child"]["pid"] != os.getpid():
+        raise Fail("Claude launch ownership was not recorded")
+    argv = json.loads(Path(record["files"]["run_dir"], "command.json").read_text())
+    os.execv(argv[0], argv)
 
 
 # --- commands --------------------------------------------------------------------
@@ -537,35 +770,44 @@ def execute(record):
 def cmd_preflight(args):
     binary = claude_bin()
     report = {
-        "ok": False,
-        "claude": binary,
-        "version": None,
-        "auth": None,
-        "git": shutil.which("git"),
-        "python": platform.python_version(),
-        "state_dir": str(crew_home()),
-        "notes": [],
+        "ok": False, "claude": binary, "version": None, "auth": None,
+        "git": shutil.which("git"), "python": platform.python_version(),
+        "state_dir": str(crew_home()), "state_writable": False,
+        "capabilities": None, "process_inspection": False, "notes": [],
     }
+    try:
+        crew_home().mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.TemporaryFile(dir=crew_home()) as probe:
+            probe.write(b"crew")
+        report["state_writable"] = True
+    except OSError:
+        report["notes"].append("The state directory is not writable.")
+    try:
+        report["process_inspection"] = process_identity(os.getpid()) is not None
+    except (OSError, Fail, subprocess.SubprocessError):
+        report["notes"].append("Process inspection with ps is required for safe cancellation.")
     if not binary:
         report["notes"].append("claude not found. Install Claude Code and sign in, or set CLAUDE_CREW_BIN.")
         return emit(report, 127)
-    report["version"] = claude_version(binary)
+    caps = report["capabilities"] = capabilities(binary)
+    report["version"] = caps["version"]
+    if not caps["restricted_profile"]:
+        report["notes"].append(f"Claude Code {caps['minimum_version']}+ with restricted/profile flags is required. Run claude update; no weaker fallback is used.")
     try:
         proc = subprocess.run([binary, "auth", "status", "--json"], capture_output=True, text=True, timeout=30)
         data = json.loads(proc.stdout)
-        # Keep only these keys: the full output can include the account email.
         report["auth"] = {key: data.get(key) for key in ("loggedIn", "authMethod", "apiProvider", "subscriptionType")}
+        if proc.returncode:
+            report["auth"]["loggedIn"] = False
     except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
-        report["notes"].append("Could not read `claude auth status`.")
+        report["notes"].append("Could not read claude auth status.")
     if not report["git"]:
-        report["notes"].append("git not found; implement runs and the read-only check need it.")
-    logged_in = (report["auth"] or {}).get("loggedIn")
-    if logged_in is not True:
-        report["notes"].append(
-            "Claude Code doesn't report a sign-in. Inside the Codex sandbox this can be a false alarm: "
-            "rerun preflight outside it before asking the user to run `claude` and sign in."
-        )
-    report["ok"] = bool(report["version"]) and logged_in is True
+        report["notes"].append("git is required for worktrees and the read-only tripwire.")
+    logged_in = (report["auth"] or {}).get("loggedIn") is True
+    if not logged_in:
+        report["notes"].append("Claude Code did not confirm authentication. Check credentials and network/keychain access under the host's permission policy.")
+    report["ok"] = all((caps["restricted_profile"], logged_in, report["git"],
+                        report["state_writable"], report["process_inspection"]))
     return emit(report, 0 if report["ok"] else 1)
 
 
@@ -582,6 +824,8 @@ def resolve_resume(args):
         raise Fail("--worktree and --base can't be combined with --resume; the run continues where the session started")
     previous = find_run(args.resume)
     if previous:
+        if previous["status"] in ACTIVE:
+            raise Fail(f"run {previous['run_id']} is still active; inspect status or cancel it first")
         if args.mode and args.mode != previous["mode"]:
             raise Fail(f"run {previous['run_id']} is a {previous['mode']} run; start a new run to switch modes")
         session_id = previous["claude"]["session_id"]
@@ -601,20 +845,60 @@ def resolve_resume(args):
 def check_allow_rules(rules):
     for rule in rules:
         match = RULE_RE.fullmatch(rule)
-        if not match or match.group(1) not in EXTRA_TOOLS:
-            raise Fail(f"--allow takes 'Bash(...)' rules, WebFetch or WebSearch, not {rule!r}")
-        if match.group(1) == "Bash" and not match.group(2):
-            raise Fail("--allow Bash would allow every command; use a scoped rule like 'Bash(npm test *)'")
-    return list(rules)
+        if not match or match.group(1) not in EXTRA_TOOLS or any(c in rule for c in (",", "\n", "\r")):
+            raise Fail(f"--allow takes scoped Bash rules, WebFetch or WebSearch, not {rule!r}")
+        if match.group(1) == "Bash":
+            command = match.group(2)[1:-1].strip() if match.group(2) else ""
+            # Require a literal executable prefix. Do not accept wildcard-only,
+            # legacy ':*', comma-separated rule injection, or multiline rules.
+            if not re.match(r"[A-Za-z0-9_./-]+(?:\s|$)", command):
+                raise Fail(f"--allow {rule!r} needs a literal command prefix, e.g. Bash(pytest *)")
+    return list(dict.fromkeys(rules))
+
+
+def effective_request(args, previous):
+    inherited = {**DEFAULT_REQUEST, **((previous or {}).get("request") or {})}
+    overrides = {}
+    for field, argument in (("model", "model"), ("effort", "effort"),
+                            ("max_turns", "max_turns"), ("max_budget_usd", "max_budget_usd"),
+                            ("timeout_s", "timeout")):
+        value = getattr(args, argument)
+        if value is not None:
+            inherited[field] = overrides[field] = value
+    allow = [] if args.clear_allow else list(inherited["allow"])
+    if args.allow:
+        allow.extend(args.allow)
+    inherited["allow"] = check_allow_rules(allow)
+    if args.allow is not None or args.clear_allow:
+        overrides["allow"] = inherited["allow"]
+    request = {key: inherited[key] for key in DEFAULT_REQUEST}
+    if request["model"] and not MODEL_RE.fullmatch(request["model"]):
+        raise Fail(f"--model {request['model']!r} doesn't look like a model alias or name")
+    if request["max_turns"] < 1 or request["timeout_s"] < 1:
+        raise Fail("--max-turns and --timeout must be at least 1")
+    budget = request["max_budget_usd"]
+    if budget is not None and (not math.isfinite(budget) or budget <= 0):
+        raise Fail("--max-budget-usd must be a finite number greater than 0")
+    request["overrides"] = overrides
+    return request
+
+
+def assert_available(mode, cwd, session_id):
+    """Run under state_lock so checking ownership and reserving it are atomic."""
+    workspace = git_root(cwd) or cwd.resolve()
+    for active in all_records():
+        if active["status"] not in ACTIVE:
+            continue
+        source_session = (active["request"].get("resume_from") or {}).get("session_id")
+        same_session = session_id and session_id in (active["claude"].get("session_id"), source_session)
+        active_workspace = (Path(active["workspace"]) if active.get("workspace") else
+                            git_root(active["cwd"]) or Path(active["cwd"]).resolve())
+        same_folder = active_workspace == workspace
+        if same_session or (same_folder and "implement" in (mode, active["mode"])):
+            raise Fail(f"run {active['run_id']} owns this session or worktree; inspect status or cancel it before continuing")
 
 
 def cmd_run(args):
-    if args.model and not MODEL_RE.fullmatch(args.model):
-        raise Fail(f"--model {args.model!r} doesn't look like a model alias or name")
-    if args.max_turns < 1 or args.timeout < 1:
-        raise Fail("--max-turns and --timeout must be at least 1")
-    if args.max_budget_usd is not None and args.max_budget_usd <= 0:
-        raise Fail("--max-budget-usd must be more than 0")
     if args.fork and not args.resume:
         raise Fail("--fork needs --resume")
     try:
@@ -623,98 +907,87 @@ def cmd_run(args):
         raise Fail(f"could not read the brief: {exc}")
     if not brief.strip():
         raise Fail("the brief is empty")
-
-    notes = []
+    previous = find_run(args.resume) if args.resume else None
+    request = effective_request(args, previous)
     if args.resume:
         mode, cwd, worktree, resume_from = resolve_resume(args)
         session_id = None if args.fork else resume_from["session_id"]
+        if args.cwd and resolve_dir(args.cwd) != cwd:
+            raise Fail("--cwd differs from the recorded session directory")
     else:
         if not args.mode:
             raise Fail("--mode is required: review or implement")
         mode, worktree, resume_from, session_id = args.mode, None, None, str(uuid.uuid4())
         if mode == "implement" and not args.worktree:
-            raise Fail("implement runs need --worktree NAME: Claude works in a new git worktree on branch crew/NAME")
+            raise Fail("implement runs need --worktree NAME")
         if mode == "review" and (args.worktree or args.base):
             raise Fail("--worktree and --base only apply to implement runs")
         cwd = resolve_dir(args.cwd)
-    allow = check_allow_rules(args.allow)
-    if not claude_bin():
+    binary = claude_bin()
+    if not binary:
         raise Fail("claude not found. Install Claude Code and sign in, or set CLAUDE_CREW_BIN.", 127, "claude_unavailable")
-    if mode == "implement" and not args.resume:
-        worktree, notes = create_worktree(cwd, args.worktree, args.base or "HEAD")
-        cwd = Path(worktree["path"])
-
-    run_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2)
-    run_dir = runs_dir() / run_id
-    run_dir.mkdir(parents=True)
-    (run_dir / "brief.md").write_text(brief)
-    record = {
-        "schema": RECORD_SCHEMA,
-        "run_id": run_id,
-        "status": "queued",
-        "mode": mode,
-        "cwd": str(cwd),
-        "worktree": worktree,
-        "created_at": now(),
-        "started_at": None,
-        "finished_at": None,
-        "codex_thread_id": os.environ.get("CODEX_THREAD_ID"),
-        "request": {
-            "model": args.model,
-            "effort": args.effort,
-            "max_turns": args.max_turns,
-            "max_budget_usd": args.max_budget_usd,
-            "timeout_s": args.timeout,
-            "allow": allow,
-            "resume_from": resume_from,
-            "fork": args.fork,
-            "background": args.background,
-        },
-        "claude": {
-            "version": None,
-            "session_id": session_id,
-            "exit_code": None,
-            "subtype": None,
-            "is_error": None,
-            "num_turns": None,
-            "duration_ms": None,
-            "cost_usd": None,
-            "models": [],
-            "permission_denials": [],
-            "errors": [],
-            "result_text": None,
-            "transcript": None,
-        },
-        "claimed": None,
-        "observed": {"changed_files": [], "commits": [], "read_only_violation": None},
-        "verification": {"verdict": "pending", "checks": [], "notes": None, "at": None},
-        "notes": notes,
-        "error": None,
-        "worker_pid": None,
-        "files": {
-            "run_dir": str(run_dir),
-            "brief": str(run_dir / "brief.md"),
-            "stdout": str(run_dir / "claude.stdout.json"),
-            "stderr": str(run_dir / "claude.stderr.log"),
-        },
-    }
-    save(record)
-
-    if args.background:
-        with open(run_dir / "worker.log", "ab") as log:
-            worker = subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), "_worker", run_id],
-                stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
-            )
-        record["worker_pid"] = worker.pid
-        return emit(record)
+    caps = capabilities(binary)
+    if not caps["restricted_profile"]:
+        raise Fail(f"Claude Code {caps['minimum_version']}+ with restricted/profile flags is required; run claude update", 1, "claude_incompatible")
+    request.update(resume_from=resume_from, fork=args.fork, background=args.background)
+    notes = []
+    # Also reserve review access against an active implementation in that checkout.
+    # Independent new worktrees do not conflict with work in the source checkout.
+    with state_lock():
+        if args.resume or mode == "review":
+            assert_available(mode, cwd, (resume_from or {}).get("session_id"))
+        if mode == "implement" and not args.resume:
+            worktree, notes = create_worktree(cwd, args.worktree, args.base or "HEAD")
+            cwd = Path(worktree["path"])
+        run_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2)
+        run_dir = runs_dir() / run_id
+        run_dir.mkdir(parents=True, mode=0o700)
+        (run_dir / "brief.md").write_text(brief)
+        prior_cost = 0 if not args.resume else None
+        if previous and not args.fork and previous["status"] == "completed":
+            latest = find_run(previous["claude"]["session_id"])
+            if latest and latest["run_id"] == previous["run_id"]:
+                prior_cost = previous["claude"].get("session_cost_usd", previous["claude"].get("cost_usd"))
+        record = {
+            "schema": RECORD_SCHEMA, "run_id": run_id, "status": "queued",
+            "mode": mode, "cwd": str(cwd), "workspace": str(git_root(cwd) or cwd), "worktree": worktree,
+            "created_at": now(), "started_at": None, "finished_at": None,
+            "codex_thread_id": os.environ.get("CODEX_THREAD_ID"), "request": request,
+            "claude": {
+                "version": caps["version"], "session_id": session_id, "exit_code": None,
+                "subtype": None, "is_error": None, "num_turns": None, "duration_ms": None,
+                "cost_usd": None, "session_cost_usd": None, "cost_delta_usd": None,
+                "models": [], "permission_denials": [], "errors": [], "result_text": None, "transcript": None,
+            },
+            "cost_baseline_usd": prior_cost, "claimed": None, "report_error": None,
+            "observed": {"changed_files": [], "commits": [], "read_only_violation": None},
+            "verification": {"verdict": "pending", "checks": [], "notes": None, "at": None},
+            "notes": notes, "error": None, "worker_pid": None, "worker": None,
+            "launcher": process_identity(os.getpid()), "child": None, "gated_launch": True,
+            "files": {"run_dir": str(run_dir), "brief": str(run_dir / "brief.md"),
+                      "stdout": str(run_dir / "claude.stdout.json"), "stderr": str(run_dir / "claude.stderr.log")},
+        }
+        save(record)
+        if args.background:
+            try:
+                with open(run_dir / "worker.log", "ab") as log:
+                    worker = subprocess.Popen(
+                        [sys.executable, str(Path(__file__).resolve()), "_worker", run_id],
+                        stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                    )
+                record.update(worker_pid=worker.pid, worker=process_identity(worker.pid))
+                save(record)  # worker cannot adopt the record until we release the lock
+            except OSError as exc:
+                record.update(status="error", error=f"could not start worker: {exc}", finished_at=now())
+                save(record)
+            return emit(record, 1 if record["status"] == "error" else 0)
     record = execute(record)
     return emit(record, {"completed": 0, "claude_unavailable": 127}.get(record["status"], 1))
 
 
 def cmd_worker(args):
-    execute(load(args.run_id))
-    return 0
+    record = execute(require_run(args.run_id))
+    return 0 if record["status"] == "completed" else 1
 
 
 def cmd_status(args):
@@ -735,6 +1008,7 @@ def cmd_list(args):
     for record in all_records():
         if args.thread and record.get("codex_thread_id") != thread:
             continue
+        record = refresh(record)
         rows.append({
             "run_id": record["run_id"],
             "created_at": record["created_at"],
@@ -760,8 +1034,13 @@ def cmd_verify(args):
         if not sep or result not in ("passed", "failed") or not command.strip():
             raise Fail(f"--check {item!r} should look like 'passed=npm test' or 'failed=npm test'")
         checks.append({"command": command.strip(), "status": result})
-    record["verification"] = {"verdict": args.verdict, "checks": checks, "notes": args.note, "at": now()}
-    save(record)
+    with state_lock():
+        record = load(record["run_id"])
+        if record["status"] in ACTIVE:
+            raise Fail("the run is still in progress")
+        assert_available(record["mode"], Path(record["cwd"]), record["claude"]["session_id"])
+        record["verification"] = {"verdict": args.verdict, "checks": checks, "notes": args.note, "at": now()}
+        save(record)
     return emit(record)
 
 
@@ -769,19 +1048,18 @@ def cmd_cancel(args):
     record = refresh(require_run(args.run))
     if record["status"] not in ACTIVE:
         return emit(record)
-    if not record.get("worker_pid"):
-        raise Fail("the run hasn't started yet; try again in a few seconds", 1, "error")
-    try:
-        os.kill(record["worker_pid"], signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    deadline = time.monotonic() + 40  # stop() gives Claude up to 25s to wind down
+    if same_process(record.get("worker")):
+        try:
+            os.kill(record["worker"]["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
         record = refresh(record)
-        if record["status"] not in ACTIVE:
+        if record["status"] not in ACTIVE or record["status"] == "orphaned":
             break
         time.sleep(1)
-    return emit(record)
+    return emit(record, 1 if record["status"] in ACTIVE else 0)
 
 
 def build_parser():
@@ -798,11 +1076,12 @@ def build_parser():
     run.add_argument("--base", metavar="REF", help="implement: commit the worktree starts from (default: HEAD)")
     run.add_argument("--model", help="model alias or full name, e.g. sonnet, opus, haiku, fable")
     run.add_argument("--effort", choices=EFFORTS)
-    run.add_argument("--allow", action="append", default=[], metavar="RULE",
+    run.add_argument("--allow", action="append", default=None, metavar="RULE",
                      help="extra permission rule, e.g. 'Bash(npm test *)' (repeatable)")
-    run.add_argument("--max-turns", type=int, default=50)
+    run.add_argument("--clear-allow", action="store_true", help="discard inherited --allow rules before adding new ones")
+    run.add_argument("--max-turns", type=int, default=None)
     run.add_argument("--max-budget-usd", type=float)
-    run.add_argument("--timeout", type=int, default=1800, help="seconds before the relay stops Claude (default: 1800)")
+    run.add_argument("--timeout", type=int, default=None, help="seconds before the relay stops Claude (default: 1800; inherited on resume)")
     run.add_argument("--resume", metavar="RUN_OR_SESSION", help="send the brief as a follow-up in an earlier run's Claude session")
     run.add_argument("--fork", action="store_true", help="with --resume: branch the session instead of continuing it")
     run.add_argument("--background", action="store_true", help="return at once and poll with `status RUN --wait SECONDS`")
@@ -827,6 +1106,8 @@ def build_parser():
 
     worker = sub.add_parser("_worker")  # internal: runs a --background run
     worker.add_argument("run_id")
+    child = sub.add_parser("_exec")  # internal gated exec, before any model can run
+    child.add_argument("run_id")
     return parser
 
 
@@ -838,6 +1119,7 @@ COMMANDS = {
     "verify": cmd_verify,
     "cancel": cmd_cancel,
     "_worker": cmd_worker,
+    "_exec": cmd_exec,
 }
 
 
@@ -847,6 +1129,8 @@ def main(argv=None):
         return COMMANDS[args.command](args)
     except Fail as exc:
         return emit({"status": exc.status, "error": str(exc)}, exc.code)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return emit({"status": "error", "error": str(exc)}, 1)
 
 
 if __name__ == "__main__":
