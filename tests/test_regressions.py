@@ -1,16 +1,18 @@
 """Failure-oriented relay tests. All workers are local fakes; no model calls."""
 
 import importlib.util
+import ctypes
 import json
 import os
 import signal
 import subprocess
 import sys
 import time
+import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from test_runner import RELAY, RelayHarness
+from test_runner import FAKE_CLAUDE, RELAY, RelayHarness, write_launcher
 
 spec = importlib.util.spec_from_file_location('crew_relay', RELAY)
 relay_module = importlib.util.module_from_spec(spec)
@@ -18,6 +20,27 @@ spec.loader.exec_module(relay_module)
 
 
 class RegressionTests(RelayHarness):
+    @staticmethod
+    def kill_pid(pid):
+        if os.name == "nt":
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            kernel32.TerminateProcess.restype = ctypes.c_int
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            handle = kernel32.OpenProcess(0x0001, False, pid)
+            if handle:
+                try:
+                    kernel32.TerminateProcess(handle, 1)
+                finally:
+                    kernel32.CloseHandle(handle)
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
     def wait_for(self, condition):
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
@@ -44,10 +67,13 @@ class RegressionTests(RelayHarness):
             record = json.loads(path.read_text())
             for identity in (record.get('child'), record.get('worker')):
                 if identity and relay_module.same_process(identity):
-                    try:
-                        os.killpg(identity['pid'], signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    if os.name == 'nt':
+                        relay_module.terminate_windows_tree(identity, owned=True)
+                    else:
+                        try:
+                            os.killpg(identity['pid'], signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
 
     def test_old_cli_is_rejected_before_creating_worktree(self):
         code, result = self.relay('run', '--mode', 'implement', '--worktree', 'unsupported', '--brief', '-',
@@ -203,12 +229,22 @@ class RegressionTests(RelayHarness):
     def test_descendant_stops_even_when_leader_has_exited(self):
         code, record = self.relay('run', '--mode', 'review', '--brief', '-', FAKE_CLAUDE_SCENARIO='descendant')
         self.assertEqual(code, 0, record)
+        if os.name == 'nt':
+            self.assertTrue(record['child']['job_name'].startswith('Local\\CodexCrew_'))
         self.assertFalse(relay_module.group_members(record['child']['pid']))
         self.assertIsNotNone(record['finished_at'])
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows-only host check')
+    def test_windows_process_inspection_does_not_require_ps(self):
+        with patch.dict(os.environ, self.env):
+            with patch.object(relay_module.shutil, 'which', side_effect=lambda name: 'git' if name == 'git' else None):
+                host = relay_module.host_status()
+        self.assertTrue(host['process_inspection'], host)
+        self.assertTrue(host['ok'], host)
+
     def test_worker_crash_reaps_live_claude_before_releasing_reservation(self):
         first = self.background(mode='implement')
-        os.kill(first['worker_pid'], signal.SIGKILL)
+        self.kill_pid(first['worker_pid'])
         self.wait_for(lambda: not relay_module.same_process(first['worker']))
         _, record = self.relay('status', first['run_id'])
         self.assertEqual(record['status'], 'error', record)
@@ -219,7 +255,7 @@ class RegressionTests(RelayHarness):
 
     def test_unidentifiable_group_stays_reserved(self):
         first = self.background(mode='implement')
-        os.kill(first['worker_pid'], signal.SIGKILL)
+        self.kill_pid(first['worker_pid'])
         self.wait_for(lambda: not relay_module.same_process(first['worker']))
         with patch.dict(os.environ, self.env):
             with patch.object(relay_module, 'stop_group', return_value=False):
@@ -234,26 +270,29 @@ class RegressionTests(RelayHarness):
     def test_reused_process_identity_is_never_signalled(self):
         current = relay_module.process_identity(os.getpid())
         wrong = dict(current, started='not this process')
-        with patch.object(relay_module, 'group_members', return_value={os.getpid(): current}):
-            with patch.object(relay_module.os, 'killpg') as kill:
+        if os.name == 'nt':
+            with patch.object(relay_module, 'process_table', return_value={os.getpid(): current}):
                 self.assertFalse(relay_module.stop_group(wrong))
-                kill.assert_not_called()
+        else:
+            with patch.object(relay_module, 'group_members', return_value={os.getpid(): current}):
+                with patch.object(relay_module.os, 'killpg') as kill:
+                    self.assertFalse(relay_module.stop_group(wrong))
+                    kill.assert_not_called()
 
     def test_startup_record_persists_worker_and_recovers_dead_queue(self):
         # Hold the CLI version probe only in execute(), after background dispatch.
         # The fake counts probes so the dispatcher's initial capability check passes.
-        shim = self.tmp / 'slow-version'
+        script = self.tmp / 'slow-version.py'
+        shim = write_launcher(self.tmp / 'slow-version', script)
         counter = self.tmp / 'version-count'
         marker = self.tmp / 'version-worker'
-        original = self.env['CLAUDE_CREW_BIN']
-        shim.write_text('#!' + sys.executable + '\n' +
-                        'import os,sys,time\nfrom pathlib import Path\n' +
+        script.write_text('import os,sys,time,subprocess\nfrom pathlib import Path\n' +
                         f'counter=Path({str(counter)!r})\n' +
                         'if sys.argv[1:]==["--version"]:\n' +
                         ' n=int(counter.read_text())+1 if counter.exists() else 1\n counter.write_text(str(n))\n' +
                         f' if n==2:\n  Path({str(marker)!r}).write_text(str(os.getpid()))\n  time.sleep(60)\n' +
-                        f'os.execv({original!r},[{original!r},*sys.argv[1:]])\n')
-        shim.chmod(0o755)
+                        f'result=subprocess.run([sys.executable,{str(FAKE_CLAUDE)!r},*sys.argv[1:]])\n' +
+                        'raise SystemExit(result.returncode)\n')
         code, first = self.relay('run', '--mode', 'review', '--background', '--brief', '-', CLAUDE_CREW_BIN=str(shim))
         self.assertEqual(code, 0)
         self.addCleanup(self.stop_test_run, first)
@@ -263,17 +302,14 @@ class RegressionTests(RelayHarness):
             stored = json.loads((Path(first['files']['run_dir']) / 'run.json').read_text())
             self.assertEqual(stored['worker_pid'], first['worker_pid'])
             self.assertIsNotNone(stored['worker'])
-            os.kill(first['worker_pid'], signal.SIGKILL)
+            self.kill_pid(first['worker_pid'])
             self.wait_for(lambda: not relay_module.same_process(first['worker']))
             _, final = self.relay('status', first['run_id'])
             self.assertEqual(final['status'], 'error')
             self.assertIsNotNone(final['finished_at'])
             self.assertFalse(self.log.exists())
         finally:
-            try:
-                os.kill(probe_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            self.kill_pid(probe_pid)
 
     def test_gated_child_without_release_never_invokes_claude(self):
         _, finished = self.relay('run', '--mode', 'review', '--brief', '-')

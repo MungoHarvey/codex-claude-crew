@@ -8,7 +8,7 @@ chosen mode, creates the git worktree for implement runs, captures the worker's
 JSON output, and writes a run record that keeps the worker's claims apart from
 Codex's own verification.
 
-Standard library only. macOS and Linux.
+Standard library only. Windows, macOS and Linux.
 
   relay.py preflight [--worker W]       check the worker CLI and sign-in (no model call)
   relay.py workers                      check which of claude, pi and opencode are usable
@@ -26,7 +26,6 @@ executables, default: `claude`, `pi` and `opencode` found on PATH).
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import math
@@ -41,16 +40,24 @@ import sys
 import tempfile
 import time
 import uuid
+import ctypes
+import ctypes.wintypes
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 RECORD_SCHEMA = "codex-claude-crew.run/v1"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 VERDICTS = ("confirmed", "partial", "rejected")
 ACTIVE = ("queued", "running", "stopping", "orphaned")
-STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+STOP_SIGNALS = ((signal.SIGTERM, signal.SIGINT, signal.SIGBREAK) if os.name == "nt"
+                else (signal.SIGTERM, signal.SIGINT, signal.SIGHUP))
 # Require both restricted mode and unattended permission denial; no weaker fallback.
 MIN_CLAUDE_VERSION = (2, 1, 259)
 PROFILE_FLAGS = ["--restricted", "--permission-prompts", "none", "--no-chrome",
@@ -253,7 +260,7 @@ def worker_bin(kind):
 
 def cli_version(binary):
     try:
-        proc = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(command_for(binary, ["--version"]), capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return None
     match = re.search(r"\d+\.\d+\.\d+", proc.stdout)
@@ -272,7 +279,7 @@ def capabilities(binary, kind):
     flags_ok = False
     if supported:
         try:
-            proc = subprocess.run([binary, *spec["probe"]], capture_output=True, text=True, timeout=30)
+            proc = subprocess.run(command_for(binary, spec["probe"]), capture_output=True, text=True, timeout=30)
             if spec["help_flags"] is None:
                 flags_ok = proc.returncode == 0 and not re.search(
                     r"unknown option|unexpected option|unrecognized", proc.stderr, re.I)
@@ -550,14 +557,32 @@ def create_worktree(cwd, name, base):
 
 @contextmanager
 def state_lock():
-    """Serialize short state transactions across CLI processes (macOS/Linux)."""
+    """Serialize short state transactions across CLI processes."""
     crew_home().mkdir(parents=True, exist_ok=True, mode=0o700)
-    with open(crew_home() / ".lock", "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+    with open(crew_home() / ".lock", "a+b") as lock:
+        if os.name == "nt":
+            lock.seek(0, os.SEEK_END)
+            if lock.tell() == 0:
+                lock.write(b"0")
+                lock.flush()
+            lock.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def record_path(run_id):
@@ -613,6 +638,8 @@ def require_run(ref):
 
 def process_table():
     """Read process identities without command lines or environment values."""
+    if os.name == "nt":
+        return windows_process_table()
     proc = subprocess.run(["ps", "-axo", "pid=,pgid=,stat=,lstart="],
                           capture_output=True, text=True, timeout=10,
                           env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
@@ -627,22 +654,308 @@ def process_table():
     return rows
 
 
+def process_group_kwargs(detached=False):
+    """Create an isolated worker process group using the host's native API."""
+    if os.name == "nt":
+        return {"creationflags": subprocess.DETACHED_PROCESS if detached else subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def python_executable():
+    """Return the real interpreter, bypassing Windows venv redirector stubs."""
+    if os.name == "nt":
+        base = getattr(sys, "_base_executable", None)
+        if base and Path(base).is_file():
+            return base
+    return sys.executable
+
+
+def command_for(binary, args):
+    """Build a native process command, safely supporting npm's Windows shims."""
+    if os.name == "nt" and Path(binary).suffix.lower() in (".cmd", ".bat"):
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        script = str(Path(binary).with_suffix(".ps1"))
+        if not powershell or not Path(script).is_file():
+            raise Fail(f"{binary} is a Windows command shim but its matching PowerShell launcher is missing")
+        return [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                "-File", script, *args]
+    return [binary, *args]
+
+
+def create_windows_job(run_id):
+    """Create a named, kill-on-close Job Object for a run's entire process tree."""
+    from ctypes import wintypes
+
+    class BASIC_LIMIT(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong),
+                    ("PerJobUserTimeLimit", ctypes.c_longlong), ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t), ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD), ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_ulonglong) for name in
+                    ("ReadOperationCount", "WriteOperationCount", "OtherOperationCount", "ReadTransferCount",
+                     "WriteTransferCount", "OtherTransferCount")]
+
+    class EXTENDED_LIMIT(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", BASIC_LIMIT), ("IoInfo", IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    name = rf"Local\CodexCrew_{run_id}"
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, wintypes.INT, ctypes.c_void_p, wintypes.DWORD]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.CreateJobObjectW(None, name)
+    if not handle:
+        raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+    limits = EXTENDED_LIMIT()
+    limits.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(handle)
+        raise OSError(error, "SetInformationJobObject failed")
+    return handle, name
+
+
+def assign_windows_job(handle, proc):
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+    if not kernel32.AssignProcessToJobObject(handle, ctypes.c_void_p(int(proc._handle))):
+        raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+
+
+def windows_job_process_ids(handle):
+    """Return process IDs still assigned to a Job Object."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.QueryInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                                                   ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
+    kernel32.QueryInformationJobObject.restype = ctypes.c_int
+    size = 65536
+    buffer = ctypes.create_string_buffer(size)
+    returned = ctypes.c_ulong()
+    if not kernel32.QueryInformationJobObject(handle, 3, buffer, size, ctypes.byref(returned)):
+        raise OSError(ctypes.get_last_error(), "QueryInformationJobObject failed")
+    assigned, listed = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ulong * 2)).contents
+    count = min(int(assigned), int(listed))
+    array_type = ctypes.c_size_t * count
+    ids = ctypes.cast(ctypes.byref(buffer, 8), ctypes.POINTER(array_type)).contents
+    return {int(pid) for pid in ids}
+
+
+def terminate_windows_job(identity, handle=None):
+    """Terminate and confirm all processes in a recorded Windows Job Object."""
+    from ctypes import wintypes
+
+    owned_handle = handle is None
+    if handle is None:
+        name = identity.get("job_name")
+        if not name:
+            return None  # old records use the process-tree fallback
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenJobObjectW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.OpenJobObjectW.restype = wintypes.HANDLE
+        handle = kernel32.OpenJobObjectW(0x0004 | 0x0008, False, name)  # QUERY | TERMINATE
+        if not handle:
+            return process_identity(identity["pid"]) is None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, wintypes.UINT]
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    try:
+        if not kernel32.TerminateJobObject(handle, 1):
+            return False
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                if not windows_job_process_ids(handle):
+                    return True
+            except OSError:
+                return False
+            time.sleep(0.1)
+        return False
+    finally:
+        if owned_handle:
+            kernel32.CloseHandle(handle)
+
+
+def windows_process_table(include_start_times=False):
+    """Enumerate process IDs and parents, optionally adding creation times."""
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME),
+                                         ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME)]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+    if snapshot == ctypes.c_void_p(-1).value or not snapshot:
+        raise OSError(ctypes.get_last_error(), "CreateToolhelp32Snapshot failed")
+    rows = {}
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            pid = int(entry.th32ProcessID)
+            started = windows_process_started(pid) if include_start_times else None
+            rows[pid] = {"pid": pid, "pgid": pid, "ppid": int(entry.th32ParentProcessID), "started": started}
+            ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return rows
+
+
+def windows_process_started(pid):
+    from ctypes import wintypes
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME),
+                                         ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME)]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return None
+    try:
+        created, exited, kernel_time, user_time = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+        if kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                    ctypes.byref(kernel_time), ctypes.byref(user_time)):
+            return (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        return None
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def process_identity(pid):
-    return process_table().get(pid)
+    row = process_table().get(pid)
+    if row and os.name == "nt":
+        row["started"] = windows_process_started(pid)
+    return row
 
 
 def same_process(identity, table=None):
     if not identity:
         return False
     actual = (process_table() if table is None else table).get(identity["pid"])
+    if actual and os.name == "nt":
+        actual = dict(actual, started=windows_process_started(identity["pid"]))
     return actual is not None and actual["started"] == identity["started"]
 
 
-def group_members(pgid):
+def group_members(pgid, started=None):
+    if os.name == "nt":
+        table = windows_process_table(include_start_times=True)
+        root = table.get(pgid)
+        root_started = root["started"] if root else started
+        if root_started is None:
+            return {}
+        members, parents = {}, {pgid}
+        changed = True
+        while changed:
+            changed = False
+            for pid, row in table.items():
+                if pid in parents or row["ppid"] not in parents:
+                    continue
+                # Avoid attaching a reused PID's unrelated descendants to an old run.
+                if row["started"] is None or row["started"] < root_started:
+                    continue
+                members[pid] = row
+                parents.add(pid)
+                changed = True
+        if root:
+            members[pgid] = root
+        return members
     return {pid: row for pid, row in process_table().items() if row["pgid"] == pgid}
 
 
-def stop_group(identity, proc=None, owned=False):
+def terminate_windows_tree(identity, owned=False):
+    """Stop a verified Windows process tree; never act on a reused root PID."""
+    stopped = terminate_windows_job(identity)
+    if stopped is not None:
+        return stopped
+    pid = identity["pid"]
+    table = process_table()
+    root = table.get(pid)
+    if root:
+        root = dict(root, started=windows_process_started(pid))
+    if root and root["started"] != identity["started"]:
+        return False
+    if not root and not owned:
+        return False
+    members = group_members(pid, identity.get("started"))
+    if not members:
+        return True
+    # Best-effort graceful stop for processes in the isolated console group.
+    if root:
+        try:
+            os.kill(pid, signal.CTRL_BREAK_EVENT)
+        except (OSError, ValueError, SystemError):
+            pass
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if not group_members(pid, identity.get("started")):
+            return True
+        time.sleep(0.1)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD]
+    kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
+    kernel32.TerminateProcess.argtypes = [ctypes.wintypes.HANDLE, ctypes.wintypes.UINT]
+    kernel32.TerminateProcess.restype = ctypes.wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+    # Terminate leaves preserve the verified parent chain until all descendants stop.
+    for member_pid, member in sorted(members.items(), key=lambda item: item[0] == pid):
+        current = process_table().get(member_pid)
+        if current is None:
+            continue
+        if current["started"] != member["started"] or current["started"] is None:
+            return False
+        handle = kernel32.OpenProcess(0x0001, False, member_pid)  # PROCESS_TERMINATE
+        if not handle:
+            return False
+        try:
+            if not kernel32.TerminateProcess(handle, 1):
+                return False
+        finally:
+            kernel32.CloseHandle(handle)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if not group_members(pid, identity.get("started")):
+            return True
+        time.sleep(0.1)
+    return not group_members(pid, identity.get("started"))
+
+
+def stop_group(identity, proc=None, owned=False, job_handle=None):
     """Stop the entire group, even after its leader exits.
 
     During recovery, refuse to signal a reused PID or an unidentifiable orphan
@@ -650,6 +963,13 @@ def stop_group(identity, proc=None, owned=False):
     """
     if not identity:
         return False
+    if os.name == "nt":
+        stopped = terminate_windows_job(identity, handle=job_handle) if job_handle is not None else None
+        if stopped is None:
+            stopped = terminate_windows_tree(identity, owned=owned)
+        if proc is not None:
+            proc.poll()
+        return stopped
     pgid = identity["pid"]
     members = group_members(pgid)
     if not members:
@@ -698,7 +1018,7 @@ def refresh(record):
         baseline = record.get("baseline") or {}
         observe(record, Path(record["git_root"]) if record.get("git_root") else None, baseline)
         return finish(record, "error", "the relay worker was lost; execution has stopped")
-    return finish(record, "orphaned", "worker lost; execution could not be confirmed stopped; inspect the recorded process group")
+    return finish(record, "orphaned", "worker lost; execution could not be confirmed stopped; inspect the recorded worker process tree")
 
 
 def finish(record, status, error):
@@ -1021,7 +1341,8 @@ def execute(record):
         save(record)  # before probing the CLI or reading the repository
 
     files = record["files"]
-    proc, child = None, None
+    proc, child, job_handle = None, None, None
+    job_name = None
     root, before = None, None
     status, error = "completed", None
     handlers = {sig: signal.signal(sig, _interrupt) for sig in STOP_SIGNALS}
@@ -1049,26 +1370,49 @@ def execute(record):
         with open(files["stdout"], "wb") as out, open(files["stderr"], "wb") as err:
             # The wrapper cannot exec Claude until we save its process identity
             # and release its stdin gate. A SIGKILL before that closes the pipe.
-            mask = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+            mask = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS) if os.name != "nt" else None
             try:
+                if os.name == "nt":
+                    job_handle, job_name = create_windows_job(record["run_id"])
                 proc = subprocess.Popen(
-                    [sys.executable, str(Path(__file__).resolve()), "_exec", record["run_id"]],
+                    [python_executable(), str(Path(__file__).resolve()), "_exec", record["run_id"]],
                     cwd=record["cwd"], stdin=subprocess.PIPE, stdout=out, stderr=err,
-                    start_new_session=True,
+                    **process_group_kwargs(),
                 )
+                if job_handle is not None:
+                    try:
+                        assign_windows_job(job_handle, proc)
+                    except OSError:
+                        # The gated child has not received permission to start the worker.
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                        raise
                 child = process_identity(proc.pid)
                 if not child:
                     raise Fail("could not identify the gated Claude process", 1, "error")
+                if job_name:
+                    child["job_name"] = job_name
                 record["child"] = child
                 with state_lock():
                     save(record)
             finally:
-                signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-            try:
-                proc.communicate(b"G" + prefix.encode() + Path(files["brief"]).read_bytes(),
-                                 timeout=record["request"]["timeout_s"])
-            except subprocess.TimeoutExpired:
-                status, error = "timed_out", f"Claude didn't finish within {record['request']['timeout_s']}s"
+                if mask is not None:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+            deadline = time.monotonic() + record["request"]["timeout_s"]
+            payload = b"G" + prefix.encode() + Path(files["brief"]).read_bytes()
+            while True:
+                remaining = max(0, deadline - time.monotonic())
+                try:
+                    proc.communicate(payload, timeout=min(0.5, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    payload = None  # communicate() resumes its pending I/O on subsequent calls
+                    if load(record["run_id"]).get("cancel_requested"):
+                        status, error = "interrupted", "the relay run was cancelled"
+                        break
+                    if time.monotonic() >= deadline:
+                        status, error = "timed_out", f"Claude didn't finish within {record['request']['timeout_s']}s"
+                        break
     except Interrupted:
         status, error = "interrupted", "the relay was stopped before Claude finished"
     except (Fail, OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -1080,9 +1424,9 @@ def execute(record):
         try:
             if proc is not None:
                 child = child or process_identity(proc.pid)
-                stopped = stop_group(child, proc=proc, owned=True) if child else proc.poll() is not None
+                stopped = stop_group(child, proc=proc, owned=True, job_handle=job_handle) if child else proc.poll() is not None
                 if not stopped:
-                    status, error = "orphaned", "execution could not be confirmed stopped; inspect the recorded process group"
+                    status, error = "orphaned", "execution could not be confirmed stopped; inspect the recorded worker process tree"
                 if proc.stdin:
                     proc.stdin.close()
                 proc.poll()
@@ -1090,6 +1434,8 @@ def execute(record):
         except (Fail, OSError, subprocess.SubprocessError) as exc:
             status, error = "orphaned", f"could not confirm process cleanup: {exc}"
         finally:
+            if job_handle is not None:
+                ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(job_handle)
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
 
@@ -1102,17 +1448,28 @@ def execute(record):
 
 def cmd_exec(args):
     """Internal gated exec: no model starts unless the owner persisted our identity."""
-    signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+    if os.name != "nt":
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
     if os.read(sys.stdin.fileno(), 1) != b"G":
         return 1
     record = require_run(args.run_id)
-    if not same_process(record.get("child")) or record["child"]["pid"] != os.getpid():
-        raise Fail("Claude launch ownership was not recorded")
+    child = record.get("child") or {}
+    # The child itself proves its PID cannot have been reused; Windows process
+    # start-time precision/access can differ across snapshots for the same live PID.
+    if child.get("pid") != os.getpid() or (os.name != "nt" and not same_process(child)):
+        raise Fail(f"Claude launch ownership was not recorded (stored PID {child.get('pid')}, current PID {os.getpid()})")
     run_dir = Path(record["files"]["run_dir"])
     argv = json.loads((run_dir / "command.json").read_text())
     overrides = run_dir / "command.env.json"
-    if overrides.is_file():
-        os.execve(argv[0], argv, {**os.environ, **json.loads(overrides.read_text())})
+    env = {**os.environ, **json.loads(overrides.read_text())} if overrides.is_file() else None
+    if os.name == "nt":
+        # Windows has no execve replacement semantics; remain as a supervised
+        # wrapper and forward the gated brief through stdin to the actual CLI.
+        worker = subprocess.Popen(command_for(argv[0], argv[1:]), stdin=sys.stdin, env=env,
+                                  **process_group_kwargs())
+        return worker.wait()
+    if env is not None:
+        os.execve(argv[0], argv, env)
     os.execv(argv[0], argv)
 
 
@@ -1128,7 +1485,7 @@ def other_auth(kind, binary, model, notes):
         notes.append("Pi checks credentials per provider; pass --model to check sign-in.")
         return None
     try:
-        proc = subprocess.run([binary, "auth", "check", "--model", model, "--json", "--no-refresh"],
+        proc = subprocess.run(command_for(binary, ["auth", "check", "--model", model, "--json", "--no-refresh"]),
                               capture_output=True, text=True, timeout=30)
         data = json.loads(proc.stdout)
         # Only the readiness fields: never echo a credential back.
@@ -1153,7 +1510,7 @@ def host_status():
     try:
         report["process_inspection"] = process_identity(os.getpid()) is not None
     except (OSError, Fail, subprocess.SubprocessError):
-        report["notes"].append("Process inspection with ps is required for safe cancellation.")
+        report["notes"].append("Native process inspection is required for safe cancellation.")
     if not report["git"]:
         report["notes"].append("git is required for worktrees and the read-only tripwire.")
     report["ok"] = bool(report["git"] and report["state_writable"] and report["process_inspection"])
@@ -1173,6 +1530,11 @@ def worker_status(kind, model=None):
     if not binary:
         status["notes"].append(f"{kind} not found. {spec['install']}, or set {spec['bin_env']}.")
         return status
+    try:
+        command_for(binary, ["--version"])
+    except Fail as exc:
+        status["notes"].append(str(exc))
+        return status
     caps = status["capabilities"] = capabilities(binary, kind)
     status["version"] = caps["version"]
     if not caps["restricted_profile"]:
@@ -1180,7 +1542,8 @@ def worker_status(kind, model=None):
                                "Update it; no weaker fallback is used.")
     if kind == "claude":
         try:
-            proc = subprocess.run([binary, "auth", "status", "--json"], capture_output=True, text=True, timeout=30)
+            proc = subprocess.run(command_for(binary, ["auth", "status", "--json"]),
+                                  capture_output=True, text=True, timeout=30)
             data = json.loads(proc.stdout)
             status["auth"] = {key: data.get(key) for key in ("loggedIn", "authMethod", "apiProvider", "subscriptionType")}
             if proc.returncode:
@@ -1415,8 +1778,8 @@ def cmd_run(args):
             try:
                 with open(run_dir / "worker.log", "ab") as log:
                     worker = subprocess.Popen(
-                        [sys.executable, str(Path(__file__).resolve()), "_worker", run_id],
-                        stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                        [python_executable(), str(Path(__file__).resolve()), "_worker", run_id],
+                        stdin=subprocess.DEVNULL, stdout=log, stderr=log, **process_group_kwargs(detached=True),
                     )
                 record.update(worker_pid=worker.pid, worker=process_identity(worker.pid))
                 save(record)  # worker cannot adopt the record until we release the lock
@@ -1492,7 +1855,12 @@ def cmd_cancel(args):
     record = refresh(require_run(args.run))
     if record["status"] not in ACTIVE:
         return emit(record)
-    if same_process(record.get("worker")):
+    with state_lock():
+        current = load(record["run_id"])
+        if current["status"] in ACTIVE:
+            current["cancel_requested"] = True
+            save(current)
+    if os.name != "nt" and same_process(record.get("worker")):
         try:
             os.kill(record["worker"]["pid"], signal.SIGTERM)
         except ProcessLookupError:

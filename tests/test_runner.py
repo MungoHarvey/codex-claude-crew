@@ -17,14 +17,26 @@ RELAY = ROOT / "skills" / "codex-crew" / "scripts" / "relay.py"
 FAKE_CLAUDE = ROOT / "tests" / "fixtures" / "fake_claude.py"
 
 
+def write_launcher(path, script):
+    """Create an executable fake CLI using the host's command format."""
+    path = Path(path)
+    if os.name == "nt":
+        path = path.with_suffix(".cmd")
+        path.write_text('@echo off\r\nrem test shim; relay uses the adjacent PowerShell launcher\r\n')
+        powershell = path.with_suffix(".ps1")
+        powershell.write_text(f"& '{sys.executable}' '{script}' @args\nexit $LASTEXITCODE\n")
+    else:
+        path.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+        path.chmod(0o755)
+    return path
+
+
 class RelayHarness(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name).resolve()
-        shim = self.tmp / "claude"
-        shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_CLAUDE}" "$@"\n')
-        shim.chmod(0o755)
+        shim = write_launcher(self.tmp / "claude", FAKE_CLAUDE)
         self.log = self.tmp / "claude-calls.jsonl"
         self.env = dict(
             os.environ,

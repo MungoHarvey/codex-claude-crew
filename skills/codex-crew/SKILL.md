@@ -2,7 +2,7 @@
 name: codex-crew
 description: Hand a bounded review or implementation task to a local coding-agent worker running headless (Claude Code by default, or Pi or OpenCode), then verify the result yourself. Use when the user asks to delegate work to Claude, Claude Code, Pi or OpenCode, wants a worker's review or a second opinion, or wants a worker to implement a change in a separate git worktree. Not for tasks the user wants you to do directly.
 license: MIT
-compatibility: Requires at least one authenticated worker CLI (Claude Code 2.1.259+, Pi 1.2.0+ or OpenCode 1.19.0+), Python 3.9+, git and ps on macOS or Linux. Network and credential access follow the host's permission policy.
+compatibility: Requires at least one authenticated worker CLI (Claude Code 2.1.259+, Pi 1.2.0+ or OpenCode 1.19.0+), Python 3.9+, git, and macOS, Linux, or Windows. Network and credential access follow the host's permission policy.
 metadata:
   version: "0.1.0"
 ---
@@ -27,9 +27,9 @@ Models: Claude takes aliases (`sonnet`). Pi and OpenCode take `provider/model`, 
 
 ## Setup, once per session
 
-If the user hasn't named a worker, `python3 <skill-dir>/scripts/relay.py workers` lists which of `claude`, `pi` and `opencode` are usable here and which is the default, without a model call. For installing or signing in to a worker, use the `codex-crew-setup` skill.
+If the user hasn't named a worker, `<python> <skill-dir>/scripts/relay.py workers` lists which of `claude`, `pi` and `opencode` are usable here and which is the default, without a model call. Use `python3` on macOS/Linux; on Windows use `py -3` when available, otherwise `python`. For installing or signing in to a worker, use the `codex-crew-setup` skill.
 
-Run `python3 <skill-dir>/scripts/relay.py preflight`, adding `--worker pi` or `--worker opencode` for those workers (Pi also takes `--model` to check that provider's sign-in). It checks CLI capabilities, authentication, process inspection and state-directory access without calling a model. If `ok` is false, resolve the reported prerequisites before delegating. Do not fall back to a weaker permission profile. OpenCode, and Pi without `--model`, cannot confirm sign-in here; a run reports the failure if credentials are missing.
+Run `<python> <skill-dir>/scripts/relay.py preflight`, adding `--worker pi` or `--worker opencode` for those workers (Pi also takes `--model` to check that provider's sign-in). It checks CLI capabilities, authentication, process inspection and state-directory access without calling a model. If `ok` is false, resolve the reported prerequisites before delegating. Do not fall back to a weaker permission profile. OpenCode, and Pi without `--model`, cannot confirm sign-in here; a run reports the failure if credentials are missing.
 
 Claude needs network and credential access. Follow the host's configured permission policy; request additional access only when required and supported. Local record commands do not need Claude authentication or network access.
 
@@ -61,30 +61,32 @@ This table is for `claude`. For Pi and OpenCode, use the model the user asks for
 ## 3. Run
 
 ```bash
-python3 <skill-dir>/scripts/relay.py run --mode review --cwd <repo> --model sonnet --effort high --brief - <<'EOF'
+<python> <skill-dir>/scripts/relay.py run --mode review --cwd <repo> --model sonnet --effort high --brief - <<'EOF'
 <brief>
 EOF
 ```
 
 ```bash
-python3 <skill-dir>/scripts/relay.py run --mode implement --cwd <repo> --worktree <short-name> \
+<python> <skill-dir>/scripts/relay.py run --mode implement --cwd <repo> --worktree <short-name> \
   --allow "Bash(npm test *)" --brief - <<'EOF'
 <brief>
 EOF
 ```
 
 ```bash
-python3 <skill-dir>/scripts/relay.py run --worker opencode --mode implement --cwd <repo> --worktree <short-name> \
+<python> <skill-dir>/scripts/relay.py run --worker opencode --mode implement --cwd <repo> --worktree <short-name> \
   --model anthropic/claude-sonnet-5-5 --allow "Bash(npm test *)" --brief - <<'EOF'
 <brief>
 EOF
 ```
 
+On Windows, use the same flags in PowerShell. Put the brief in a here-string and pipe it to `--brief -`; the Bash heredocs and backslash continuations above are Unix-shell examples.
+
 - `--allow RULE` (repeatable) lets Claude run a command without asking, for example `"Bash(pytest *)"`. Add one for every authorized check. Broad forms such as `Bash` and `Bash(*)` are refused. Shell permissions are not an OS sandbox; choose commands consistent with the mode and owned scope. OpenCode receives the same rules as bash patterns, and Pi's command gate enforces them.
 - `--max-turns` (default 50), `--max-budget-usd` and `--timeout` (seconds, default 1800) limit each invocation. A budget is a client-side estimate, not a strict billing ceiling or an aggregate task budget.
 - `--base REF` starts the worktree from another commit (default `HEAD`). The user's uncommitted changes are not in the worktree.
 
-Runs take minutes. Give the shell command time for `--timeout` plus startup and cleanup, or add `--background` and poll with `relay.py status <run_id> --wait 30`. `relay.py cancel <run_id>` stops the recorded process group. An `orphaned` run could not be confirmed stopped: inspect its process identities before proceeding; do not verify or resume it.
+Runs take minutes. Give the shell command time for `--timeout` plus startup and cleanup, or add `--background` and poll with `relay.py status <run_id> --wait 30`. `relay.py cancel <run_id>` stops the recorded worker process tree. An `orphaned` run could not be confirmed stopped: inspect its process identities before proceeding; do not verify or resume it.
 
 ## 4. Read the run record
 
@@ -103,7 +105,7 @@ The relay prints a JSON record and saves it as `~/.codex-claude-crew/runs/<run_i
 - Tell the user if `observed.read_only_violation` is true or `observed.commits` isn't empty. A null tripwire result means coverage is incomplete; inspect independently. Ignored paths and changes outside the repo are not covered.
 
 ```bash
-python3 <skill-dir>/scripts/relay.py verify <run_id> --verdict confirmed --check "passed=npm test" --note "<one line>"
+<python> <skill-dir>/scripts/relay.py verify <run_id> --verdict confirmed --check "passed=npm test" --note "<one line>"
 ```
 
 Verdicts are `confirmed`, `partial` and `rejected`. The relay stores them apart from Claude's claim.

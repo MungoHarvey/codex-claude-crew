@@ -10,7 +10,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from test_runner import ROOT, RelayHarness
+from test_runner import ROOT, RelayHarness, write_launcher
 
 FIXTURES = ROOT / "tests" / "fixtures"
 GATE = ROOT / "skills" / "codex-crew" / "scripts" / "pi_command_gate.js"
@@ -21,9 +21,7 @@ class WorkerHarness(RelayHarness):
         super().setUp()
         self.worker_log = self.tmp / "worker-calls.jsonl"
         for name, variable in (("pi", "CREW_PI_BIN"), ("opencode", "CREW_OPENCODE_BIN")):
-            shim = self.tmp / name
-            shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FIXTURES / f"fake_{name}.py"}" "$@"\n')
-            shim.chmod(0o755)
+            shim = write_launcher(self.tmp / name, FIXTURES / f"fake_{name}.py")
             self.env[variable] = str(shim)
         self.env["FAKE_WORKER_LOG"] = str(self.worker_log)
 

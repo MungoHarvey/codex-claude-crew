@@ -18,9 +18,9 @@ The plugin packages both skills and their relay scripts.
 
 ## Install individual skills
 
-Requires Codex, at least one authenticated worker CLI (Claude Code, Pi or OpenCode), Python and git on macOS or Linux. See [requirements and supported versions](docs/VERSIONS.md#requirements).
+Requires Codex, at least one authenticated worker CLI (Claude Code, Pi or OpenCode), Python 3.9+ and git on macOS, Linux or Windows. See [requirements and supported versions](docs/VERSIONS.md#requirements).
 
-Cursor Agent is not currently a supported relay worker. Although its CLI is available on some machines, this project does not yet have a Cursor adapter; the relay also depends on POSIX process and file-locking APIs and does not run natively on Windows.
+Cursor Agent is not currently a supported relay worker. Although its CLI is available on some machines, this project does not yet have a Cursor adapter. The relay supports native Windows, macOS and Linux.
 
 ```bash
 npx skills add MungoHarvey/codex-claude-crew --skill codex-crew --agent codex -g

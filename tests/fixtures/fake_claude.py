@@ -42,7 +42,8 @@ def main():
     stdin = sys.stdin.read()
     with open(os.environ["FAKE_CLAUDE_LOG"], "a") as log:
         log.write(json.dumps({"argv": argv, "cwd": os.getcwd(), "stdin": stdin,
-                              "pid": os.getpid(), "pgid": os.getpgrp()}) + "\n")
+                              "pid": os.getpid(),
+                              "pgid": os.getpid() if not hasattr(os, "getpgrp") else os.getpgrp()}) + "\n")
     session_id = flag(argv, "--session-id") or flag(argv, "--resume")
     if "--fork-session" in argv:
         session_id = str(uuid.uuid4())
