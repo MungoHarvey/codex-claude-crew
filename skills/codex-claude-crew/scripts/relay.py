@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""Run one bounded task in a local Claude Code session for Codex.
+"""Run one bounded task in a local coding-agent session for Codex.
 
-Codex calls this script instead of building `claude -p` commands by hand. It sets
-the permission boundary for the chosen mode, creates the git worktree for
-implement runs, captures Claude's JSON output, and writes a run record that keeps
-Claude's claims apart from Codex's own verification.
+Codex calls this script instead of building worker commands by hand. The worker is
+Claude Code (`claude -p`, the default), Pi (`pi --mode json`) or OpenCode
+(`opencode run --format json`). The relay sets the permission boundary for the
+chosen mode, creates the git worktree for implement runs, captures the worker's
+JSON output, and writes a run record that keeps the worker's claims apart from
+Codex's own verification.
 
 Standard library only. macOS and Linux.
 
-  relay.py preflight                    check the claude CLI and sign-in (no model call)
+  relay.py preflight [--worker W]       check the worker CLI and sign-in (no model call)
   relay.py run --mode review ...        start a run (see `relay.py run --help`)
   relay.py status RUN [--wait SECONDS]  print a run record
   relay.py list [--limit N] [--thread]  list recent runs
   relay.py verify RUN --verdict V ...   record Codex's own verification
   relay.py cancel RUN                   stop a running run
 
-Environment: CLAUDE_CREW_HOME (state folder, default ~/.codex-claude-crew) and
-CLAUDE_CREW_BIN (path to the claude executable, default: found on PATH).
+Environment: CLAUDE_CREW_HOME (state folder, default ~/.codex-claude-crew), and
+CLAUDE_CREW_BIN, CREW_PI_BIN and CREW_OPENCODE_BIN (paths to the worker
+executables, default: `claude`, `pi` and `opencode` found on PATH).
 """
 
 from __future__ import annotations
@@ -52,7 +55,34 @@ PROFILE_FLAGS = ["--restricted", "--permission-prompts", "none", "--no-chrome",
                  "--disable-slash-commands", "--strict-mcp-config",
                  "--mcp-config", '{"mcpServers":{}}']
 DEFAULT_REQUEST = {"model": None, "effort": None, "max_turns": 50,
-                   "max_budget_usd": None, "timeout_s": 1800, "allow": []}
+                   "max_budget_usd": None, "timeout_s": 1800, "allow": [],
+                   "unscoped_bash": False}
+
+# Pi and OpenCode workers. Minimum versions are the releases these profiles were
+# checked against; the relay refuses older ones rather than guess at their flags.
+WORKERS = ("claude", "pi", "opencode")
+WORKER_BIN_ENV = {"claude": "CLAUDE_CREW_BIN", "pi": "CREW_PI_BIN", "opencode": "CREW_OPENCODE_BIN"}
+MIN_VERSION = {"claude": MIN_CLAUDE_VERSION, "pi": (1, 2, 0), "opencode": (1, 19, 0)}
+# Pi: skip extensions, skills, prompt templates, themes, MCP, AGENTS.md/CLAUDE.md
+# and project-local .pi resources, and make no startup network calls.
+PI_PROFILE_FLAGS = ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes",
+                    "--no-context-files", "--no-mcp", "--no-approve", "--offline"]
+PI_READ_TOOLS = ["read", "grep", "find", "ls"]
+# OpenCode: skip project config, AGENTS.md lookup, plugins, .claude prompts/skills,
+# external skills, sharing and update checks. The permission boundary is a named
+# agent passed in OPENCODE_CONFIG_CONTENT; agent rules are evaluated after the
+# user's global rules, so its catch-all deny wins.
+OPENCODE_PROFILE_ENV = {
+    "OPENCODE_DISABLE_PROJECT_CONFIG": "1", "OPENCODE_PURE": "1",
+    "OPENCODE_DISABLE_CLAUDE_CODE": "1", "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
+    "OPENCODE_DISABLE_AUTOUPDATE": "1", "OPENCODE_DISABLE_SHARE": "1",
+}
+OPENCODE_RUN_FLAGS = ("--format", "--agent", "--session", "--fork", "--variant", "--model", "--print-logs")
+OPENCODE_AGENT = "codex-crew-{mode}"
+OPENCODE_READ_PERMISSIONS = {
+    "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow"},
+    "glob": "allow", "grep": "allow", "list": "allow", "todowrite": "allow", "todoread": "allow",
+}
 
 READ_TOOLS = ["Read", "Glob", "Grep"]
 EXTRA_TOOLS = ("Bash", "WebFetch", "WebSearch")  # what --allow may add
@@ -68,6 +98,7 @@ DENY_RULES = ["Bash(git commit *)", "Bash(git push *)", "mcp__*"]
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,47}")
 RUN_ID_RE = re.compile(r"\d{8}-\d{6}-[0-9a-f]{4}")
 UUID_RE = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
+SESSION_RE = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}|ses_[A-Za-z0-9]{8,64}")
 MODEL_RE = re.compile(r"[A-Za-z0-9._:@/\[\]-]{1,100}")
 RULE_RE = re.compile(r"([A-Za-z][A-Za-z0-9_]*)(\(.+\))?")
 
@@ -129,6 +160,13 @@ MODE_RULES = {
     "List every file you changed in `changed_files`.",
 }
 
+# Pi and OpenCode have no schema-constrained output, so the report contract is
+# stated in the prompt and the relay validates the JSON it gets back.
+REPORT_RULES = """\
+Your final message is your report. It must contain only one JSON object in a ```json fenced block, \
+matching this JSON Schema, with nothing after the block:
+""" + json.dumps(REPORT_SCHEMA, separators=(",", ":"))
+
 
 class Fail(Exception):
     """Stops a command: prints {"status", "error"} as JSON and exits with `code`."""
@@ -163,12 +201,16 @@ def runs_dir():
 # --- Claude Code CLI ---------------------------------------------------------
 
 
-def claude_bin():
-    configured = os.environ.get("CLAUDE_CREW_BIN")
+def worker_bin(kind="claude"):
+    configured = os.environ.get(WORKER_BIN_ENV[kind])
     if configured:
         path = Path(configured).expanduser().resolve()
         return str(path) if path.is_file() and os.access(path, os.X_OK) else None
-    return shutil.which("claude")
+    return shutil.which(kind)
+
+
+def claude_bin():
+    return worker_bin("claude")
 
 
 def claude_version(binary):
@@ -184,8 +226,10 @@ def version_tuple(version):
     return tuple(int(part) for part in version.split(".")) if version else ()
 
 
-def capabilities(binary):
+def capabilities(binary, kind="claude"):
     """Probe parser support without a model call. Help alone can omit valid flags."""
+    if kind != "claude":
+        return other_capabilities(binary, kind)
     version = claude_version(binary)
     supported = version_tuple(version) >= MIN_CLAUDE_VERSION
     flags_ok = False
@@ -246,8 +290,121 @@ def claude_args(record, version):
     return args
 
 
-def transcript_path(cwd, session_id):
-    """Claude Code keeps each session at ~/.claude/projects/<cwd with non-alphanumerics as ->/<id>.jsonl."""
+# --- Pi and OpenCode CLIs ------------------------------------------------------
+
+
+def other_capabilities(binary, kind):
+    """Pi and OpenCode: a version floor plus the flags the profile depends on."""
+    version = claude_version(binary)
+    supported = version_tuple(version) >= MIN_VERSION[kind]
+    flags_ok = False
+    if supported:
+        probe = [binary, "--help"] if kind == "pi" else [binary, "run", "--help"]
+        needed = [*PI_PROFILE_FLAGS, "--session-id", "--fork", "--mode", "--tools", "--thinking"] \
+            if kind == "pi" else OPENCODE_RUN_FLAGS
+        try:
+            proc = subprocess.run(probe, capture_output=True, text=True, timeout=30)
+            flags_ok = proc.returncode == 0 and all(flag in proc.stdout + proc.stderr for flag in needed)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return {"version": version, "minimum_version": ".".join(map(str, MIN_VERSION[kind])),
+            "version_supported": supported, "restricted_profile": bool(flags_ok)}
+
+
+def pi_tools(mode, request):
+    """Pi has no per-command rules: bash is either absent or unrestricted."""
+    tools = list(PI_READ_TOOLS)
+    if mode == "implement":
+        tools += ["edit", "write"]
+        if request.get("unscoped_bash"):
+            tools.append("bash")
+    return tools
+
+
+def pi_args(record):
+    mode, request = record["mode"], record["request"]
+    rules = [WORKER_RULES, MODE_RULES[mode]]
+    if "bash" not in pi_tools(mode, request):
+        rules.append("This run has no shell tool. Say in `checks` which commands you could not run.")
+    rules.append(REPORT_RULES)
+    args = ["--mode", "json", *PI_PROFILE_FLAGS,
+            "--tools", ",".join(pi_tools(mode, request)),
+            "--append-system-prompt", "\n\n".join(rules)]
+    if request["model"]:
+        args += ["--model", request["model"]]
+    if request["effort"]:
+        args += ["--thinking", request["effort"]]
+    if request["resume_from"] and request["fork"]:
+        args += ["--fork", request["resume_from"]["session_id"], "--session-id", record["claude"]["session_id"]]
+    elif request["resume_from"]:
+        args += ["--session", request["resume_from"]["session_id"]]
+    else:
+        args += ["--session-id", record["claude"]["session_id"]]
+    return args
+
+
+def opencode_bash_pattern(rule):
+    """`Bash(npm test *)` becomes the OpenCode bash pattern `npm test *`."""
+    return rule[len("Bash("):-1].strip()
+
+
+def opencode_agent(record):
+    """The agent definition that carries the permission boundary for one run."""
+    mode, request = record["mode"], record["request"]
+    bash = {"*": "deny"}
+    for rule in [*GIT_READ_RULES, *(r for r in request["allow"] if r.startswith("Bash("))]:
+        bash[opencode_bash_pattern(rule)] = "allow"
+    bash.update({"git commit *": "deny", "git push *": "deny"})
+    permission = {"*": "deny", **OPENCODE_READ_PERMISSIONS, "bash": bash, "external_directory": "deny"}
+    if mode == "implement":
+        permission["edit"] = "allow"
+    for tool in ("WebFetch", "WebSearch"):
+        if tool in request["allow"]:
+            permission[tool.lower()] = "allow"
+    return {"mode": "primary", "description": f"codex-claude-crew {mode} worker",
+            "steps": request["max_turns"], "permission": permission}
+
+
+def opencode_args(record):
+    request = record["request"]
+    # Error logs go to stderr: OpenCode's JSON error events often say only "Unexpected server error".
+    args = ["run", "--format", "json", "--agent", OPENCODE_AGENT.format(mode=record["mode"]),
+            "--print-logs", "--log-level", "ERROR"]
+    if request["model"]:
+        args += ["--model", request["model"]]
+    if request["effort"]:
+        args += ["--variant", request["effort"]]
+    if request["resume_from"]:
+        args += ["--session", request["resume_from"]["session_id"]]
+        if request["fork"]:
+            args.append("--fork")
+    return args
+
+
+def worker_command(record, binary, version):
+    """(argv, environment overrides, text sent ahead of the brief) for a run."""
+    kind = record.get("agent", "claude")
+    if kind == "claude":
+        return [binary, *claude_args(record, version)], {}, ""
+    if kind == "pi":
+        return [binary, *pi_args(record)], {}, ""
+    config = {"$schema": "https://opencode.ai/config.json",
+              "agent": {OPENCODE_AGENT.format(mode=record["mode"]): opencode_agent(record)}}
+    env = {**OPENCODE_PROFILE_ENV, "OPENCODE_CONFIG_CONTENT": json.dumps(config, separators=(",", ":"))}
+    # OpenCode keeps its own system prompt; the worker contract leads the message.
+    prefix = "\n\n".join([WORKER_RULES, MODE_RULES[record["mode"]], REPORT_RULES, "Brief:"]) + "\n\n"
+    return [binary, *opencode_args(record)], env, prefix
+
+
+def transcript_path(cwd, session_id, kind="claude"):
+    """Where the worker keeps the session. OpenCode stores sessions in a database instead."""
+    if kind == "pi":
+        root = Path(os.environ.get("PI_CODING_AGENT_SESSION_DIR") or
+                    Path(os.environ.get("PI_CODING_AGENT_DIR") or Path.home() / ".pi" / "agent") / "sessions")
+        matches = sorted(root.glob(f"*/*{session_id}*.jsonl")) if root.is_dir() else []
+        return str(matches[-1]) if matches else None
+    if kind != "claude":
+        return None
     projects = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
     for folder in (cwd, os.path.realpath(cwd)):
         path = projects / re.sub(r"[^A-Za-z0-9]", "-", folder) / f"{session_id}.jsonl"
@@ -401,10 +558,10 @@ def all_records():
 
 
 def find_run(ref):
-    """Look a run up by run id, or by Claude session id (newest run of that session)."""
+    """Look a run up by run id, or by worker session id (newest run of that session)."""
     if RUN_ID_RE.fullmatch(ref) and record_path(ref).is_file():
         return load(ref)
-    if UUID_RE.fullmatch(ref):
+    if SESSION_RE.fullmatch(ref):
         for record in all_records():
             if record["claude"].get("session_id") == ref:
                 return record
@@ -511,7 +668,7 @@ def refresh(record):
 def finish(record, status, error):
     session_id = record["claude"]["session_id"]
     if session_id:
-        record["claude"]["transcript"] = transcript_path(record["cwd"], session_id)
+        record["claude"]["transcript"] = transcript_path(record["cwd"], session_id, record.get("agent", "claude"))
     record.update(status=status, error=error,
                   finished_at=None if status in ACTIVE else now(), recovery_owner=None)
     with state_lock():
@@ -580,7 +737,171 @@ def validate_report(value, schema=REPORT_SCHEMA, path="report"):
     return None
 
 
+def json_lines(stdout):
+    """JSONL records, skipping anything else the CLI printed on stdout."""
+    for line in stdout.splitlines():
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            yield data
+
+
+def extract_report(text):
+    """The JSON report from a worker's final message: the last ```json block, else the last object."""
+    if not isinstance(text, str):
+        return None
+    for block in reversed(re.findall(r"```(?:json)?\s*\n(.*?)```", text, re.S)):
+        try:
+            return json.loads(block)
+        except ValueError:
+            continue
+    decoder = json.JSONDecoder()
+    for start in [i for i, char in enumerate(text) if char == "{"][::-1][:200]:
+        try:
+            value, _ = decoder.raw_decode(text, start)
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def finite_cost(value):
+    return value if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
+
+
+def record_invocation_cost(record, cost):
+    """Pi and OpenCode report what this invocation cost; the session total needs the baseline."""
+    claude = record["claude"]
+    prior = finite_cost(record.get("cost_baseline_usd"))
+    claude["cost_delta_usd"] = round(cost, 10) if cost is not None else None
+    total = round(prior + cost, 10) if cost is not None and prior is not None else None
+    claude["cost_usd"] = claude["session_cost_usd"] = total
+
+
+def tool_input_detail(value):
+    if not isinstance(value, dict):
+        return str(value)[:300]
+    detail = value.get("command") or value.get("filePath") or value.get("file_path") or value.get("path") \
+        or value.get("url") or json.dumps(value)
+    return str(detail)[:300]
+
+
+def read_pi_events(record, stdout):
+    """Fold `pi --mode json` events into the session block. Returns the final text and failure."""
+    claude = record["claude"]
+    enabled = set(pi_tools(record["mode"], record["request"]))
+    final, failure, cost, turns, models, denials = None, None, None, 0, set(), []
+    for event in json_lines(stdout):
+        kind = event.get("type")
+        if kind == "session" and isinstance(event.get("id"), str):
+            claude["session_id"] = event["id"]
+        elif kind == "turn_end":
+            turns += 1
+        elif kind == "tool_execution_end" and event.get("isError") and event.get("toolName") not in enabled:
+            # Pi has no permission prompts: a call to a tool outside the profile simply fails.
+            denials.append({"tool": event.get("toolName"), "input": tool_input_detail(event.get("args"))})
+        elif kind == "agent_settled" and event.get("aborted"):
+            failure = "Pi aborted the run"
+        elif kind == "message_end" and isinstance(event.get("message"), dict):
+            message = event["message"]
+            if message.get("role") != "assistant":
+                continue
+            if message.get("provider") and message.get("model"):
+                models.add(f"{message['provider']}/{message['model']}")
+            spent = finite_cost(((message.get("usage") or {}).get("cost") or {}).get("total"))
+            if spent is not None:
+                cost = (cost or 0) + spent
+            reason = message.get("stopReason")
+            if reason in ("error", "aborted", "length"):
+                failure = message.get("errorMessage") or f"Pi stopped with {reason}"
+            elif reason == "stop":
+                failure = None
+                blocks = message.get("content") if isinstance(message.get("content"), list) else []
+                final = "".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
+    claude.update(num_turns=turns, models=sorted(models), permission_denials=denials)
+    record_invocation_cost(record, cost)
+    return final, failure
+
+
+def read_opencode_events(record, stdout):
+    """Fold `opencode run --format json` events into the session block."""
+    claude = record["claude"]
+    final, failure, cost, turns, denials, errors = None, None, None, 0, [], []
+    for line in stdout.splitlines():
+        # Without --auto, `opencode run` rejects every permission prompt and says so on stdout.
+        match = re.search(r"permission requested: (\S+) \((.*)\); auto-rejecting", line)
+        if match:
+            denials.append({"tool": match.group(1), "input": match.group(2)[:300]})
+    for event in json_lines(stdout):
+        if isinstance(event.get("sessionID"), str) and not claude["session_id"]:
+            claude["session_id"] = event["sessionID"]
+        part = event.get("part") if isinstance(event.get("part"), dict) else {}
+        kind = event.get("type")
+        if kind == "text" and isinstance(part.get("text"), str):
+            final = part["text"]
+        elif kind == "step_finish":
+            turns += 1
+            spent = finite_cost(part.get("cost"))
+            if spent is not None:
+                cost = (cost or 0) + spent
+        elif kind == "tool_use":
+            state = part.get("state") if isinstance(part.get("state"), dict) else {}
+            message = str(state.get("error") or "")
+            if state.get("status") == "error" and re.search(r"permission|prevents you|rejected|denied", message, re.I):
+                denials.append({"tool": part.get("tool"), "input": tool_input_detail(state.get("input"))})
+        elif kind == "error":
+            detail = event.get("error") if isinstance(event.get("error"), dict) else {}
+            data = detail.get("data") if isinstance(detail.get("data"), dict) else {}
+            errors.append(str(data.get("message") or detail.get("name") or "OpenCode reported an error"))
+    if errors:
+        failure = "; ".join(errors)
+    # The session id is the new one after a fork, and fixed for a plain resume.
+    if record["request"]["resume_from"] and not record["request"]["fork"]:
+        claude["session_id"] = record["request"]["resume_from"]["session_id"]
+    claude.update(num_turns=turns, permission_denials=denials, errors=errors)
+    record_invocation_cost(record, cost)
+    return final, failure
+
+
+def read_other_result(record, stdout, stderr, status, error):
+    """Pi and OpenCode: the run succeeds only with a clean exit, no reported failure and a valid report."""
+    claude, kind = record["claude"], record["agent"]
+    if not any(True for _ in json_lines(stdout)):
+        if status == "completed":
+            status, error = "error", f"{kind} returned no JSON events"
+            tail = stderr.strip()[-1500:]
+            if tail:
+                error += f": {tail}"
+        return status, error
+    reader = read_pi_events if kind == "pi" else read_opencode_events
+    final, failure = reader(record, stdout)
+    claude.update(result_text=final, is_error=bool(failure) or claude["exit_code"] not in (0, None),
+                  subtype="error" if failure else "success")
+    if failure:
+        claude["errors"] = claude.get("errors") or [failure]
+    claimed = extract_report(final)
+    report_error = validate_report(claimed) if claimed is not None else "report is missing"
+    record["report_error"] = report_error
+    record["claimed"] = claimed if report_error is None else None
+    if status == "completed" and (failure or claude["exit_code"] != 0):
+        status, error = "error", failure or f"{kind} exited with code {claude['exit_code']}"
+        tail = stderr.strip()[-1500:]
+        if not failure and tail:
+            error += f": {tail}"
+        logged = [line for line in stderr.splitlines() if "level=ERROR" in line and " error=" in line]
+        if failure and logged:
+            error += " (log: " + logged[-1].split(" error=", 1)[1].split(" cause=", 1)[0][:500] + ")"
+    if status == "completed" and report_error:
+        status, error = "error", f"{kind} returned an invalid or missing structured report: {report_error}"
+    return status, error
+
+
 def read_result(record, stdout, stderr, status, error):
+    if record.get("agent", "claude") != "claude":
+        return read_other_result(record, stdout, stderr, status, error)
     claude = record["claude"]
     result = parse_result(stdout)
     if result is None:
@@ -677,16 +998,21 @@ def execute(record):
     root, before = None, None
     status, error = "completed", None
     handlers = {sig: signal.signal(sig, _interrupt) for sig in STOP_SIGNALS}
+    kind = record.get("agent", "claude")
+    prefix = ""
     try:
-        binary = claude_bin()
+        binary = worker_bin(kind)
         if not binary:
-            raise Fail("claude not found; install Claude Code or set CLAUDE_CREW_BIN", 127, "claude_unavailable")
-        caps = capabilities(binary)
+            raise Fail(f"{kind} not found; install it or set {WORKER_BIN_ENV[kind]}", 127, unavailable_status(kind))
+        caps = capabilities(binary, kind)
         record["claude"]["version"] = caps["version"]
         if not caps["restricted_profile"]:
-            raise Fail(f"Claude Code {caps['minimum_version']}+ with the restricted profile is required; run claude update", 1, "error")
-        argv = [binary, *claude_args(record, caps["version"])]
+            raise Fail(f"{kind} {caps['minimum_version']}+ with the relay's profile flags is required; update it", 1, "error")
+        argv, env, prefix = worker_command(record, binary, caps["version"])
         Path(files["run_dir"], "command.json").write_text(json.dumps(argv, indent=2))
+        if env:
+            # Kept apart from argv; the gated child merges it into its environment.
+            Path(files["run_dir"], "command.env.json").write_text(json.dumps(env, indent=2))
         if record["mode"] == "review":
             root = git_root(record["cwd"])
             try:
@@ -718,7 +1044,8 @@ def execute(record):
             finally:
                 signal.pthread_sigmask(signal.SIG_SETMASK, mask)
             try:
-                proc.communicate(b"G" + Path(files["brief"]).read_bytes(), timeout=record["request"]["timeout_s"])
+                proc.communicate(b"G" + prefix.encode() + Path(files["brief"]).read_bytes(),
+                                 timeout=record["request"]["timeout_s"])
             except subprocess.TimeoutExpired:
                 status, error = "timed_out", f"Claude didn't finish within {record['request']['timeout_s']}s"
     except Interrupted:
@@ -760,21 +1087,52 @@ def cmd_exec(args):
     record = require_run(args.run_id)
     if not same_process(record.get("child")) or record["child"]["pid"] != os.getpid():
         raise Fail("Claude launch ownership was not recorded")
-    argv = json.loads(Path(record["files"]["run_dir"], "command.json").read_text())
+    run_dir = Path(record["files"]["run_dir"])
+    argv = json.loads((run_dir / "command.json").read_text())
+    overrides = run_dir / "command.env.json"
+    if overrides.is_file():
+        os.execve(argv[0], argv, {**os.environ, **json.loads(overrides.read_text())})
     os.execv(argv[0], argv)
 
 
 # --- commands --------------------------------------------------------------------
 
 
+def unavailable_status(kind):
+    return "claude_unavailable" if kind == "claude" else "worker_unavailable"
+
+
+def other_auth(kind, binary, model, notes):
+    """Pi can check one provider's credentials; OpenCode has no machine-readable sign-in check."""
+    if kind == "opencode":
+        notes.append("OpenCode has no machine-readable sign-in check; run `opencode auth list` to see providers.")
+        return None
+    if not model:
+        notes.append("Pi checks credentials per provider; pass --model to check sign-in.")
+        return None
+    try:
+        proc = subprocess.run([binary, "auth", "check", "--model", model, "--json", "--no-refresh"],
+                              capture_output=True, text=True, timeout=30)
+        data = json.loads(proc.stdout)
+        # Only the readiness fields: never echo a credential back.
+        return {"loggedIn": proc.returncode == 0 and data.get("status") == "ready",
+                "status": data.get("status"), "provider": data.get("provider"), "authType": data.get("authType")}
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
+        notes.append("Could not read pi auth status.")
+        return None
+
+
 def cmd_preflight(args):
-    binary = claude_bin()
+    kind = args.worker
+    binary = worker_bin(kind)
     report = {
-        "ok": False, "claude": binary, "version": None, "auth": None,
+        "ok": False, "worker": kind, "binary": binary, "version": None, "auth": None,
         "git": shutil.which("git"), "python": platform.python_version(),
         "state_dir": str(crew_home()), "state_writable": False,
         "capabilities": None, "process_inspection": False, "notes": [],
     }
+    if kind == "claude":
+        report["claude"] = binary  # earlier name of `binary`, kept for existing callers
     try:
         crew_home().mkdir(parents=True, exist_ok=True, mode=0o700)
         with tempfile.TemporaryFile(dir=crew_home()) as probe:
@@ -787,26 +1145,33 @@ def cmd_preflight(args):
     except (OSError, Fail, subprocess.SubprocessError):
         report["notes"].append("Process inspection with ps is required for safe cancellation.")
     if not binary:
-        report["notes"].append("claude not found. Install Claude Code and sign in, or set CLAUDE_CREW_BIN.")
+        report["notes"].append(f"{kind} not found. Install it and sign in, or set {WORKER_BIN_ENV[kind]}.")
         return emit(report, 127)
-    caps = report["capabilities"] = capabilities(binary)
+    caps = report["capabilities"] = capabilities(binary, kind)
     report["version"] = caps["version"]
     if not caps["restricted_profile"]:
-        report["notes"].append(f"Claude Code {caps['minimum_version']}+ with restricted/profile flags is required. Run claude update; no weaker fallback is used.")
-    try:
-        proc = subprocess.run([binary, "auth", "status", "--json"], capture_output=True, text=True, timeout=30)
-        data = json.loads(proc.stdout)
-        report["auth"] = {key: data.get(key) for key in ("loggedIn", "authMethod", "apiProvider", "subscriptionType")}
-        if proc.returncode:
-            report["auth"]["loggedIn"] = False
-    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
-        report["notes"].append("Could not read claude auth status.")
+        report["notes"].append(f"{kind} {caps['minimum_version']}+ with the relay's profile flags is required. "
+                               "Update it; no weaker fallback is used.")
+    if kind == "claude":
+        try:
+            proc = subprocess.run([binary, "auth", "status", "--json"], capture_output=True, text=True, timeout=30)
+            data = json.loads(proc.stdout)
+            report["auth"] = {key: data.get(key) for key in ("loggedIn", "authMethod", "apiProvider", "subscriptionType")}
+            if proc.returncode:
+                report["auth"]["loggedIn"] = False
+        except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
+            report["notes"].append("Could not read claude auth status.")
+    else:
+        report["auth"] = other_auth(kind, binary, args.model, report["notes"])
     if not report["git"]:
         report["notes"].append("git is required for worktrees and the read-only tripwire.")
     logged_in = (report["auth"] or {}).get("loggedIn") is True
-    if not logged_in:
-        report["notes"].append("Claude Code did not confirm authentication. Check credentials and network/keychain access under the host's permission policy.")
-    report["ok"] = all((caps["restricted_profile"], logged_in, report["git"],
+    # Pi without --model and OpenCode cannot confirm sign-in here; they do not block.
+    auth_ok = logged_in or (kind != "claude" and report["auth"] is None)
+    if not auth_ok:
+        report["notes"].append(f"{kind} did not confirm authentication. Check credentials and network/keychain "
+                               "access under the host's permission policy.")
+    report["ok"] = all((caps["restricted_profile"], auth_ok, report["git"],
                         report["state_writable"], report["process_inspection"]))
     return emit(report, 0 if report["ok"] else 1)
 
@@ -830,12 +1195,12 @@ def resolve_resume(args):
             raise Fail(f"run {previous['run_id']} is a {previous['mode']} run; start a new run to switch modes")
         session_id = previous["claude"]["session_id"]
         if not session_id:
-            raise Fail(f"run {previous['run_id']} has no Claude session id to resume")
+            raise Fail(f"run {previous['run_id']} has no worker session id to resume")
         if not Path(previous["cwd"]).is_dir():
             raise Fail(f"{previous['cwd']} no longer exists, so its session can't be resumed there")
         resume_from = {"run_id": previous["run_id"], "session_id": session_id}
         return previous["mode"], Path(previous["cwd"]), previous["worktree"], resume_from
-    if not UUID_RE.fullmatch(args.resume):
+    if not SESSION_RE.fullmatch(args.resume):
         raise Fail(f"no run or session found for {args.resume!r}")
     if args.mode != "review":
         raise Fail("to resume a session the relay didn't start, pass --mode review and the --cwd it ran in")
@@ -865,6 +1230,10 @@ def effective_request(args, previous):
         value = getattr(args, argument)
         if value is not None:
             inherited[field] = overrides[field] = value
+    if args.clear_allow:
+        inherited["unscoped_bash"] = False
+    if args.unscoped_bash:
+        inherited["unscoped_bash"] = overrides["unscoped_bash"] = True
     allow = [] if args.clear_allow else list(inherited["allow"])
     if args.allow:
         allow.extend(args.allow)
@@ -881,6 +1250,34 @@ def effective_request(args, previous):
         raise Fail("--max-budget-usd must be a finite number greater than 0")
     request["overrides"] = overrides
     return request
+
+
+def check_worker_request(kind, mode, request, args):
+    """Refuse limits a worker cannot enforce, rather than record them as if they held."""
+    notes = []
+    bash_rules = [rule for rule in request["allow"] if rule.startswith("Bash")]
+    web_rules = [rule for rule in request["allow"] if not rule.startswith("Bash")]
+    if kind != "pi" and request["unscoped_bash"]:
+        raise Fail("--unscoped-bash only applies to Pi; use scoped --allow 'Bash(...)' rules")
+    if kind == "claude":
+        return notes
+    if request["max_budget_usd"] is not None:
+        raise Fail(f"{kind} has no spending limit, so --max-budget-usd can't be enforced; bound the run with --timeout")
+    if kind == "opencode":
+        return notes
+    if args.max_turns is not None:
+        raise Fail("Pi has no turn limit, so --max-turns can't be enforced; bound the run with --timeout")
+    notes.append("Pi has no turn limit; only --timeout bounds this run.")
+    if web_rules:
+        raise Fail("Pi's profile has no web tools; WebFetch and WebSearch can't be allowed")
+    if mode == "review" and request["unscoped_bash"]:
+        raise Fail("Pi review runs have no shell; --unscoped-bash only applies to implement runs")
+    if bash_rules and not request["unscoped_bash"]:
+        raise Fail("Pi can't scope shell commands: its bash tool is all or nothing. Pass --unscoped-bash "
+                   "to allow every command in the worktree, or use the claude or opencode worker")
+    if request["unscoped_bash"]:
+        notes.append("Pi ran with an unrestricted bash tool (--unscoped-bash); --allow rules are not enforced.")
+    return notes
 
 
 def assert_available(mode, cwd, session_id):
@@ -908,27 +1305,36 @@ def cmd_run(args):
     if not brief.strip():
         raise Fail("the brief is empty")
     previous = find_run(args.resume) if args.resume else None
+    kind = previous.get("agent", "claude") if previous else (args.worker or "claude")
+    if previous and args.worker and args.worker != kind:
+        raise Fail(f"run {previous['run_id']} used the {kind} worker; a session can't move to another worker")
     request = effective_request(args, previous)
     if args.resume:
         mode, cwd, worktree, resume_from = resolve_resume(args)
         session_id = None if args.fork else resume_from["session_id"]
+        if args.fork and kind == "pi":
+            session_id = str(uuid.uuid4())  # Pi takes the fork's id up front, like a new session
         if args.cwd and resolve_dir(args.cwd) != cwd:
             raise Fail("--cwd differs from the recorded session directory")
     else:
         if not args.mode:
             raise Fail("--mode is required: review or implement")
-        mode, worktree, resume_from, session_id = args.mode, None, None, str(uuid.uuid4())
+        # OpenCode assigns its own session id, which arrives in the event stream.
+        mode, worktree, resume_from = args.mode, None, None
+        session_id = None if kind == "opencode" else str(uuid.uuid4())
         if mode == "implement" and not args.worktree:
             raise Fail("implement runs need --worktree NAME")
         if mode == "review" and (args.worktree or args.base):
             raise Fail("--worktree and --base only apply to implement runs")
         cwd = resolve_dir(args.cwd)
-    binary = claude_bin()
+    worker_notes = check_worker_request(kind, mode, request, args)
+    binary = worker_bin(kind)
     if not binary:
-        raise Fail("claude not found. Install Claude Code and sign in, or set CLAUDE_CREW_BIN.", 127, "claude_unavailable")
-    caps = capabilities(binary)
+        raise Fail(f"{kind} not found. Install it and sign in, or set {WORKER_BIN_ENV[kind]}.", 127, unavailable_status(kind))
+    caps = capabilities(binary, kind)
     if not caps["restricted_profile"]:
-        raise Fail(f"Claude Code {caps['minimum_version']}+ with restricted/profile flags is required; run claude update", 1, "claude_incompatible")
+        raise Fail(f"{kind} {caps['minimum_version']}+ with the relay's profile flags is required; update it", 1,
+                   "claude_incompatible" if kind == "claude" else "worker_incompatible")
     request.update(resume_from=resume_from, fork=args.fork, background=args.background)
     notes = []
     # Also reserve review access against an active implementation in that checkout.
@@ -939,6 +1345,7 @@ def cmd_run(args):
         if mode == "implement" and not args.resume:
             worktree, notes = create_worktree(cwd, args.worktree, args.base or "HEAD")
             cwd = Path(worktree["path"])
+        notes = notes + worker_notes
         run_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2)
         run_dir = runs_dir() / run_id
         run_dir.mkdir(parents=True, mode=0o700)
@@ -949,10 +1356,12 @@ def cmd_run(args):
             if latest and latest["run_id"] == previous["run_id"]:
                 prior_cost = previous["claude"].get("session_cost_usd", previous["claude"].get("cost_usd"))
         record = {
-            "schema": RECORD_SCHEMA, "run_id": run_id, "status": "queued",
+            "schema": RECORD_SCHEMA, "run_id": run_id, "status": "queued", "agent": kind,
             "mode": mode, "cwd": str(cwd), "workspace": str(git_root(cwd) or cwd), "worktree": worktree,
             "created_at": now(), "started_at": None, "finished_at": None,
             "codex_thread_id": os.environ.get("CODEX_THREAD_ID"), "request": request,
+            # The worker session block. It is named `claude` for every worker so
+            # existing readers of schema v1 records keep working.
             "claude": {
                 "version": caps["version"], "session_id": session_id, "exit_code": None,
                 "subtype": None, "is_error": None, "num_turns": None, "duration_ms": None,
@@ -965,7 +1374,8 @@ def cmd_run(args):
             "notes": notes, "error": None, "worker_pid": None, "worker": None,
             "launcher": process_identity(os.getpid()), "child": None, "gated_launch": True,
             "files": {"run_dir": str(run_dir), "brief": str(run_dir / "brief.md"),
-                      "stdout": str(run_dir / "claude.stdout.json"), "stderr": str(run_dir / "claude.stderr.log")},
+                      "stdout": str(run_dir / ("claude.stdout.json" if kind == "claude" else f"{kind}.stdout.jsonl")),
+                      "stderr": str(run_dir / f"{kind}.stderr.log")},
         }
         save(record)
         if args.background:
@@ -982,7 +1392,7 @@ def cmd_run(args):
                 save(record)
             return emit(record, 1 if record["status"] == "error" else 0)
     record = execute(record)
-    return emit(record, {"completed": 0, "claude_unavailable": 127}.get(record["status"], 1))
+    return emit(record, {"completed": 0, "claude_unavailable": 127, "worker_unavailable": 127}.get(record["status"], 1))
 
 
 def cmd_worker(args):
@@ -1012,6 +1422,7 @@ def cmd_list(args):
         rows.append({
             "run_id": record["run_id"],
             "created_at": record["created_at"],
+            "worker": record.get("agent", "claude"),
             "mode": record["mode"],
             "status": record["status"],
             "cwd": record["cwd"],
@@ -1066,19 +1477,25 @@ def build_parser():
     parser = argparse.ArgumentParser(prog="relay.py", description="Run bounded tasks in a local Claude Code session for Codex.")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("preflight", help="check the claude CLI, its version and sign-in without a model call")
+    preflight = sub.add_parser("preflight", help="check a worker CLI, its version and sign-in without a model call")
+    preflight.add_argument("--worker", choices=WORKERS, default="claude")
+    preflight.add_argument("--model", help="pi: the model whose provider credentials to check")
 
     run = sub.add_parser("run", help="start a review or implement run")
+    run.add_argument("--worker", choices=WORKERS, help="claude (default), pi or opencode; resumes keep their worker")
     run.add_argument("--mode", choices=("review", "implement"))
     run.add_argument("--brief", required=True, help="path to the brief, or - to read it from stdin")
     run.add_argument("--cwd", help="folder to work in (default: the current folder)")
     run.add_argument("--worktree", metavar="NAME", help="implement: create a git worktree on branch crew/NAME")
     run.add_argument("--base", metavar="REF", help="implement: commit the worktree starts from (default: HEAD)")
-    run.add_argument("--model", help="model alias or full name, e.g. sonnet, opus, haiku, fable")
-    run.add_argument("--effort", choices=EFFORTS)
+    run.add_argument("--model", help="model alias or name, e.g. sonnet (claude), anthropic/claude-sonnet-5-5 (pi, opencode)")
+    run.add_argument("--effort", choices=EFFORTS, help="claude --effort, pi --thinking, opencode --variant")
     run.add_argument("--allow", action="append", default=None, metavar="RULE",
                      help="extra permission rule, e.g. 'Bash(npm test *)' (repeatable)")
-    run.add_argument("--clear-allow", action="store_true", help="discard inherited --allow rules before adding new ones")
+    run.add_argument("--clear-allow", action="store_true",
+                     help="discard inherited --allow rules and --unscoped-bash before adding new ones")
+    run.add_argument("--unscoped-bash", action="store_true",
+                     help="pi implement runs: enable Pi's bash tool, which cannot be limited to specific commands")
     run.add_argument("--max-turns", type=int, default=None)
     run.add_argument("--max-budget-usd", type=float)
     run.add_argument("--timeout", type=int, default=None, help="seconds before the relay stops Claude (default: 1800; inherited on resume)")
