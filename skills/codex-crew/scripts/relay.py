@@ -55,8 +55,7 @@ PROFILE_FLAGS = ["--restricted", "--permission-prompts", "none", "--no-chrome",
                  "--disable-slash-commands", "--strict-mcp-config",
                  "--mcp-config", '{"mcpServers":{}}']
 DEFAULT_REQUEST = {"model": None, "effort": None, "max_turns": 50,
-                   "max_budget_usd": None, "timeout_s": 1800, "allow": [],
-                   "unscoped_bash": False}
+                   "max_budget_usd": None, "timeout_s": 1800, "allow": []}
 
 # Pi and OpenCode workers. Minimum versions are the releases these profiles were
 # checked against; the relay refuses older ones rather than guess at their flags.
@@ -68,6 +67,10 @@ MIN_VERSION = {"claude": MIN_CLAUDE_VERSION, "pi": (1, 2, 0), "opencode": (1, 19
 PI_PROFILE_FLAGS = ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes",
                     "--no-context-files", "--no-mcp", "--no-approve", "--offline"]
 PI_READ_TOOLS = ["read", "grep", "find", "ls"]
+# Pi has no permission rules, so this extension blocks bash commands outside the
+# run's rules. It loads with -e, which still works under --no-extensions.
+PI_GATE = Path(__file__).resolve().with_name("pi_command_gate.js")
+PI_GATE_BLOCKED = "codex-crew: command not allowed"
 # OpenCode: skip project config, AGENTS.md lookup, plugins, .claude prompts/skills,
 # external skills, sharing and update checks. The permission boundary is a named
 # agent passed in OPENCODE_CONFIG_CONTENT; agent rules are evaluated after the
@@ -302,7 +305,7 @@ def other_capabilities(binary, kind):
     flags_ok = False
     if supported:
         probe = [binary, "--help"] if kind == "pi" else [binary, "run", "--help"]
-        needed = [*PI_PROFILE_FLAGS, "--session-id", "--fork", "--mode", "--tools", "--thinking"] \
+        needed = [*PI_PROFILE_FLAGS, "--session-id", "--fork", "--mode", "--tools", "--thinking", "--extension"] \
             if kind == "pi" else OPENCODE_RUN_FLAGS
         try:
             proc = subprocess.run(probe, capture_output=True, text=True, timeout=30)
@@ -313,25 +316,27 @@ def other_capabilities(binary, kind):
             "version_supported": supported, "restricted_profile": bool(flags_ok)}
 
 
-def pi_tools(mode, request):
-    """Pi has no per-command rules: bash is either absent or unrestricted."""
-    tools = list(PI_READ_TOOLS)
-    if mode == "implement":
-        tools += ["edit", "write"]
-        if request.get("unscoped_bash"):
-            tools.append("bash")
-    return tools
+def pi_tools(mode):
+    """bash is always present; PI_GATE decides which commands it may run."""
+    return PI_READ_TOOLS + (["edit", "write"] if mode == "implement" else []) + ["bash"]
+
+
+def pi_command_rules(request):
+    """The gate's rules: read-only git, the run's --allow commands, never commit or push."""
+    allow = [rule[len("Bash("):-1].strip() for rule in [*GIT_READ_RULES, *request["allow"]] if rule.startswith("Bash(")]
+    return {"allow": allow, "deny": ["git commit *", "git push *"]}
 
 
 def pi_args(record):
-    mode, request = record["mode"], record["request"]
-    rules = [WORKER_RULES, MODE_RULES[mode]]
-    if "bash" not in pi_tools(mode, request):
-        rules.append("This run has no shell tool. Say in `checks` which commands you could not run.")
-    rules.append(REPORT_RULES)
-    args = ["--mode", "json", *PI_PROFILE_FLAGS,
-            "--tools", ",".join(pi_tools(mode, request)),
+    mode = record["mode"]
+    rules = [WORKER_RULES, MODE_RULES[mode],
+             "Shell commands outside the allowed set are blocked; mark them `denied` in `checks`. "
+             "Run each command on its own, without redirecting output to files or substituting commands.",
+             REPORT_RULES]
+    args = ["--mode", "json", *PI_PROFILE_FLAGS, "--extension", str(PI_GATE),
+            "--tools", ",".join(pi_tools(mode)),
             "--append-system-prompt", "\n\n".join(rules)]
+    request = record["request"]
     if request["model"]:
         args += ["--model", request["model"]]
     if request["effort"]:
@@ -389,7 +394,10 @@ def worker_command(record, binary, version):
     if kind == "claude":
         return [binary, *claude_args(record, version)], {}, ""
     if kind == "pi":
-        return [binary, *pi_args(record)], {}, ""
+        if not PI_GATE.is_file():
+            raise Fail(f"the Pi command gate is missing ({PI_GATE}); reinstall the skill", 1, "error")
+        env = {"CODEX_CREW_PI_RULES": json.dumps(pi_command_rules(record["request"]), separators=(",", ":"))}
+        return [binary, *pi_args(record)], env, ""
     config = {"$schema": "https://opencode.ai/config.json",
               "agent": {OPENCODE_AGENT.format(mode=record["mode"]): opencode_agent(record)}}
     env = {**OPENCODE_PROFILE_ENV, "OPENCODE_CONFIG_CONTENT": json.dumps(config, separators=(",", ":"))}
@@ -794,17 +802,22 @@ def tool_input_detail(value):
 def read_pi_events(record, stdout):
     """Fold `pi --mode json` events into the session block. Returns the final text and failure."""
     claude = record["claude"]
-    enabled = set(pi_tools(record["mode"], record["request"]))
+    enabled = set(pi_tools(record["mode"]))
     final, failure, cost, turns, models, denials = None, None, None, 0, set(), []
+    started = {}  # tool_execution_end does not repeat the arguments; take them from the start event
     for event in json_lines(stdout):
         kind = event.get("type")
+        if kind == "tool_execution_start":
+            started[event.get("toolCallId")] = event.get("args")
         if kind == "session" and isinstance(event.get("id"), str):
             claude["session_id"] = event["id"]
         elif kind == "turn_end":
             turns += 1
-        elif kind == "tool_execution_end" and event.get("isError") and event.get("toolName") not in enabled:
-            # Pi has no permission prompts: a call to a tool outside the profile simply fails.
-            denials.append({"tool": event.get("toolName"), "input": tool_input_detail(event.get("args"))})
+        elif kind == "tool_execution_end" and event.get("isError") and (
+                event.get("toolName") not in enabled or PI_GATE_BLOCKED in json.dumps(event.get("result"))):
+            # A call outside the profile fails, and the gate blocks commands outside the rules.
+            args = event.get("args") or started.get(event.get("toolCallId"))
+            denials.append({"tool": event.get("toolName"), "input": tool_input_detail(args)})
         elif kind == "agent_settled" and event.get("aborted"):
             failure = "Pi aborted the run"
         elif kind == "message_end" and isinstance(event.get("message"), dict):
@@ -1232,10 +1245,6 @@ def effective_request(args, previous):
         value = getattr(args, argument)
         if value is not None:
             inherited[field] = overrides[field] = value
-    if args.clear_allow:
-        inherited["unscoped_bash"] = False
-    if args.unscoped_bash:
-        inherited["unscoped_bash"] = overrides["unscoped_bash"] = True
     allow = [] if args.clear_allow else list(inherited["allow"])
     if args.allow:
         allow.extend(args.allow)
@@ -1257,10 +1266,7 @@ def effective_request(args, previous):
 def check_worker_request(kind, mode, request, args):
     """Refuse limits a worker cannot enforce, rather than record them as if they held."""
     notes = []
-    bash_rules = [rule for rule in request["allow"] if rule.startswith("Bash")]
     web_rules = [rule for rule in request["allow"] if not rule.startswith("Bash")]
-    if kind != "pi" and request["unscoped_bash"]:
-        raise Fail("--unscoped-bash only applies to Pi; use scoped --allow 'Bash(...)' rules")
     if kind == "claude":
         return notes
     if request["max_budget_usd"] is not None:
@@ -1272,13 +1278,6 @@ def check_worker_request(kind, mode, request, args):
     notes.append("Pi has no turn limit; only --timeout bounds this run.")
     if web_rules:
         raise Fail("Pi's profile has no web tools; WebFetch and WebSearch can't be allowed")
-    if mode == "review" and request["unscoped_bash"]:
-        raise Fail("Pi review runs have no shell; --unscoped-bash only applies to implement runs")
-    if bash_rules and not request["unscoped_bash"]:
-        raise Fail("Pi can't scope shell commands: its bash tool is all or nothing. Pass --unscoped-bash "
-                   "to allow every command in the worktree, or use the claude or opencode worker")
-    if request["unscoped_bash"]:
-        notes.append("Pi ran with an unrestricted bash tool (--unscoped-bash); --allow rules are not enforced.")
     return notes
 
 
@@ -1495,9 +1494,7 @@ def build_parser():
     run.add_argument("--allow", action="append", default=None, metavar="RULE",
                      help="extra permission rule, e.g. 'Bash(npm test *)' (repeatable)")
     run.add_argument("--clear-allow", action="store_true",
-                     help="discard inherited --allow rules and --unscoped-bash before adding new ones")
-    run.add_argument("--unscoped-bash", action="store_true",
-                     help="pi implement runs: enable Pi's bash tool, which cannot be limited to specific commands")
+                     help="discard inherited --allow rules before adding new ones")
     run.add_argument("--max-turns", type=int, default=None)
     run.add_argument("--max-budget-usd", type=float)
     run.add_argument("--timeout", type=int, default=None, help="seconds before the relay stops Claude (default: 1800; inherited on resume)")

@@ -3,7 +3,7 @@
 Emits the `pi --mode json` event shapes the relay reads: a session header, then
 message, turn, tool and settle events. FAKE_WORKER_SCENARIO picks the behavior:
 success (default), edit, error, no_report, bash_denied or sleep. Each run appends
-its argv, cwd and stdin to the JSON-lines file named by FAKE_WORKER_LOG.
+its argv, cwd, stdin and command-gate rules to the JSON-lines file named by FAKE_WORKER_LOG.
 """
 
 import json
@@ -12,7 +12,8 @@ import sys
 import time
 
 HELP_FLAGS = ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
-              "--no-mcp", "--no-approve", "--offline", "--session-id", "--fork", "--mode", "--tools", "--thinking"]
+              "--no-mcp", "--no-approve", "--offline", "--session-id", "--fork", "--mode", "--tools", "--thinking",
+              "--extension"]
 
 
 def flag(argv, name):
@@ -49,7 +50,8 @@ def main():
     scenario = os.environ.get("FAKE_WORKER_SCENARIO", "success")
     stdin = sys.stdin.read()
     with open(os.environ["FAKE_WORKER_LOG"], "a") as log:
-        log.write(json.dumps({"argv": argv, "cwd": os.getcwd(), "stdin": stdin}) + "\n")
+        log.write(json.dumps({"argv": argv, "cwd": os.getcwd(), "stdin": stdin,
+                              "rules": os.environ.get("CODEX_CREW_PI_RULES")}) + "\n")
     session_id = flag(argv, "--session-id") or flag(argv, "--session")
     emit({"type": "session", "version": 3, "id": session_id, "cwd": os.getcwd()})
     emit({"type": "agent_start"})
@@ -59,9 +61,10 @@ def main():
         with open("crew-was-here.txt", "w") as fh:
             fh.write("hello from the fake pi\n")
     if scenario == "bash_denied":
-        emit({"type": "tool_execution_end", "toolCallId": "c1", "toolName": "bash",
-              "args": {"command": "npm install"}, "result": {"content": [{"type": "text", "text": "Tool bash not found"}]},
-              "isError": True})
+        # Real Pi puts the arguments on the start event only.
+        emit({"type": "tool_execution_start", "toolCallId": "c1", "toolName": "bash", "args": {"command": "npm install"}})
+        emit({"type": "tool_execution_end", "toolCallId": "c1", "toolName": "bash", "isError": True, "result": {
+            "content": [{"type": "text", "text": "codex-crew: command not allowed: npm install"}], "details": {}}})
     emit({"type": "turn_end", "message": {}, "toolResults": []})
     if scenario == "error":
         emit({"type": "message_end", "message": assistant("", stop="error", error="429 rate limited")})

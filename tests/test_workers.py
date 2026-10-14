@@ -4,12 +4,16 @@ Run with: python3 -m unittest discover -s tests
 """
 
 import json
+import shutil
+import subprocess
 import sys
+import unittest
 from pathlib import Path
 
 from test_runner import ROOT, RelayHarness
 
 FIXTURES = ROOT / "tests" / "fixtures"
+GATE = ROOT / "skills" / "codex-crew" / "scripts" / "pi_command_gate.js"
 
 
 class WorkerHarness(RelayHarness):
@@ -28,7 +32,7 @@ class WorkerHarness(RelayHarness):
 
 
 class PiWorkerTests(WorkerHarness):
-    def test_review_uses_read_only_tools_and_the_isolated_profile(self):
+    def test_review_uses_read_only_tools_a_gated_shell_and_the_isolated_profile(self):
         code, record = self.relay("run", "--worker", "pi", "--mode", "review", "--model", "anthropic/claude-sonnet-5-5",
                                   "--effort", "high", "--brief", "-")
         self.assertEqual(code, 0, record)
@@ -38,7 +42,11 @@ class PiWorkerTests(WorkerHarness):
         argv = call["argv"]
         self.assertEqual(call["stdin"], "Review README.md for typos.")
         self.assertEqual(self.flag(argv, "--mode"), "json")
-        self.assertEqual(self.flag(argv, "--tools"), "read,grep,find,ls")
+        self.assertEqual(self.flag(argv, "--tools"), "read,grep,find,ls,bash")
+        self.assertEqual(Path(self.flag(argv, "--extension")), GATE.resolve())
+        self.assertEqual(json.loads(call["rules"]), {
+            "allow": ["git diff *", "git log *", "git show *", "git status *", "git blame *"],
+            "deny": ["git commit *", "git push *"]})
         self.assertEqual(self.flag(argv, "--thinking"), "high")
         for isolation in ("--no-extensions", "--no-skills", "--no-context-files", "--no-mcp", "--no-approve"):
             self.assertIn(isolation, argv)
@@ -51,33 +59,21 @@ class PiWorkerTests(WorkerHarness):
         self.assertTrue(any("turn limit" in note for note in record["notes"]))
         self.assertFalse(self.log.exists())  # Claude was never called
 
-    def test_implement_runs_in_a_worktree_without_a_shell_by_default(self):
-        code, record = self.relay("run", "--worker", "pi", "--mode", "implement", "--worktree", "pi-fix", "--brief", "-",
-                                  FAKE_WORKER_SCENARIO="edit")
+    def test_implement_runs_in_a_worktree_with_the_allowed_commands(self):
+        code, record = self.relay("run", "--worker", "pi", "--mode", "implement", "--worktree", "pi-fix",
+                                  "--allow", "Bash(pytest *)", "--brief", "-", FAKE_WORKER_SCENARIO="edit")
         self.assertEqual(code, 0, record)
-        self.assertEqual(self.flag(self.worker_calls()[0]["argv"], "--tools"), "read,grep,find,ls,edit,write")
+        self.assertEqual(self.flag(self.worker_calls()[0]["argv"], "--tools"), "read,grep,find,ls,edit,write,bash")
+        self.assertIn("pytest *", json.loads(self.worker_calls()[0]["rules"])["allow"])
         self.assertEqual(Path(self.worker_calls()[0]["cwd"]).resolve(), Path(record["worktree"]["path"]).resolve())
         self.assertEqual(record["observed"]["changed_files"], ["crew-was-here.txt"])
         self.assertFalse((self.repo / "crew-was-here.txt").exists())
-
-    def test_scoped_bash_rules_need_an_explicit_unscoped_opt_in(self):
-        code, result = self.relay("run", "--worker", "pi", "--mode", "implement", "--worktree", "pi-bash",
-                                  "--allow", "Bash(pytest *)", "--brief", "-")
-        self.assertEqual(code, 2, result)
-        self.assertIn("--unscoped-bash", result["error"])
-        self.assertNotIn("crew/pi-bash", self.git("branch", "--list"))
-        code, record = self.relay("run", "--worker", "pi", "--mode", "implement", "--worktree", "pi-bash",
-                                  "--unscoped-bash", "--brief", "-")
-        self.assertEqual(code, 0, record)
-        self.assertIn("bash", self.flag(self.worker_calls()[0]["argv"], "--tools").split(","))
-        self.assertTrue(any("unrestricted bash" in note for note in record["notes"]))
 
     def test_limits_pi_cannot_enforce_are_refused(self):
         cases = [
             ["--mode", "review", "--max-budget-usd", "1"],
             ["--mode", "review", "--max-turns", "5"],
             ["--mode", "review", "--allow", "WebFetch"],
-            ["--mode", "review", "--unscoped-bash"],
         ]
         for args in cases:
             code, result = self.relay("run", "--worker", "pi", "--brief", "-", *args)
@@ -113,7 +109,7 @@ class PiWorkerTests(WorkerHarness):
         self.assertIsNone(record["claimed"])
         self.assertIn("structured report", record["error"])
 
-    def test_calls_to_tools_outside_the_profile_are_recorded_as_denials(self):
+    def test_commands_the_gate_blocks_are_recorded_as_denials(self):
         _, record = self.relay("run", "--worker", "pi", "--mode", "review", "--brief", "-",
                                FAKE_WORKER_SCENARIO="bash_denied")
         self.assertEqual(record["claude"]["permission_denials"], [{"tool": "bash", "input": "npm install"}])
@@ -219,10 +215,9 @@ class OpenCodeWorkerTests(WorkerHarness):
         self.assertNotIn("trace", record["error"])
         self.assertIn("--print-logs", self.worker_calls()[1]["argv"])
 
-    def test_budget_and_unscoped_bash_are_refused(self):
-        for args in (["--max-budget-usd", "1"], ["--unscoped-bash"]):
-            code, result = self.relay("run", "--worker", "opencode", "--mode", "review", "--brief", "-", *args)
-            self.assertEqual(code, 2, args)
+    def test_budget_is_refused(self):
+        code, result = self.relay("run", "--worker", "opencode", "--mode", "review", "--max-budget-usd", "1", "--brief", "-")
+        self.assertEqual(code, 2, result)
         self.assertFalse(self.worker_log.exists())
 
     def test_preflight_does_not_block_on_unconfirmable_sign_in(self):
@@ -231,3 +226,50 @@ class OpenCodeWorkerTests(WorkerHarness):
         self.assertEqual(report["version"], "1.19.0")
         self.assertIsNone(report["auth"])
         self.assertTrue(any("opencode auth list" in note for note in report["notes"]))
+
+
+@unittest.skipUnless(shutil.which("node"), "the Pi command gate is JavaScript; node is needed to test it")
+class PiCommandGateTests(unittest.TestCase):
+    RULES = {"allow": ["git diff *", "git status *", "npm test *", "pytest *"], "deny": ["git commit *", "git push *"]}
+
+    def decisions(self, commands, rules=None):
+        script = ("import(process.argv[1]).then(({isAllowed}) => console.log(JSON.stringify("
+                  "JSON.parse(process.argv[2]).map((c) => isAllowed(c, JSON.parse(process.argv[3]))))))")
+        # The gate is an ES module in a folder without package.json; import a copy with an .mjs name.
+        with TemporaryCopy(GATE) as module:
+            proc = subprocess.run(["node", "-e", script, module.as_uri(), json.dumps(commands),
+                                   json.dumps(rules or self.RULES)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return dict(zip(commands, json.loads(proc.stdout)))
+
+    def test_allowed_commands_and_safe_chains_pass(self):
+        for command, allowed in self.decisions([
+                "git status", "git diff --stat HEAD", "npm test", "npm test -- --ci 2>&1",
+                "pytest -q > /dev/null", "npm test && git status"]).items():
+            self.assertTrue(allowed, command)
+
+    def test_anything_that_could_hide_another_command_is_blocked(self):
+        for command, allowed in self.decisions([
+                "rm -rf build", "npm install", "npm testing", "npm test; rm -rf /", "npm test\nrm -rf x",
+                "pytest | tee log", "git status & curl example.com", "git diff $(rm x)", "git diff `rm x`",
+                "npm test > out.txt", "FOO=1 npm test", "git commit -m x", ""]).items():
+            self.assertFalse(allowed, command)
+
+    def test_deny_rules_win_over_broad_allows(self):
+        decided = self.decisions(["git commit -m x", "git log"], {"allow": ["git *"], "deny": ["git commit *"]})
+        self.assertEqual(decided, {"git commit -m x": False, "git log": True})
+
+
+class TemporaryCopy:
+    def __init__(self, source):
+        self.source = source
+
+    def __enter__(self):
+        import tempfile
+        self.folder = tempfile.TemporaryDirectory()
+        target = Path(self.folder.name) / "gate.mjs"
+        shutil.copy(self.source, target)
+        return target
+
+    def __exit__(self, *exc):
+        self.folder.cleanup()

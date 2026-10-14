@@ -17,9 +17,9 @@ Every Claude run uses Claude's restricted profile, disables MCP, Chrome and skil
 
 | | Pi | OpenCode |
 |---|---|---|
-| Permission boundary | Tool allowlist (`--tools`). No per-command rules | A relay-defined agent (`codex-crew-review` or `codex-crew-implement`) in `OPENCODE_CONFIG_CONTENT`, with `"*": "deny"` first and specific allows after |
-| review tools | `read`, `grep`, `find`, `ls`; no shell | read, glob, grep, list; bash denied except read-only git and `--allow` patterns |
-| implement tools | Adds `edit`, `write`. `bash` only with `--unscoped-bash`, and then unrestricted | Adds `edit`; same bash rules |
+| Permission boundary | Tool allowlist (`--tools`) plus the relay's command gate (`scripts/pi_command_gate.js`, loaded with `--extension`) | A relay-defined agent (`codex-crew-review` or `codex-crew-implement`) in `OPENCODE_CONFIG_CONTENT`, with `"*": "deny"` first and specific allows after |
+| review tools | `read`, `grep`, `find`, `ls`, `bash`; the gate allows only read-only git and `--allow` patterns | read, glob, grep, list; bash denied except read-only git and `--allow` patterns |
+| implement tools | Adds `edit`, `write`; same command rules | Adds `edit`; same bash rules |
 | Isolation | `--no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-mcp --no-approve --offline` | `OPENCODE_DISABLE_PROJECT_CONFIG`, `OPENCODE_PURE`, `OPENCODE_DISABLE_CLAUDE_CODE`, `OPENCODE_DISABLE_EXTERNAL_SKILLS`, `OPENCODE_DISABLE_AUTOUPDATE`, `OPENCODE_DISABLE_SHARE` |
 | Worker rules and report schema | `--append-system-prompt` | Prepended to the brief on stdin |
 | Limits | Timeout only | `steps` (from `--max-turns`) and timeout |
@@ -27,7 +27,7 @@ Every Claude run uses Claude's restricted profile, disables MCP, Chrome and skil
 
 OpenCode evaluates permissions last-match-wins, and an agent's rules are appended after the user's global rules, so the relay's catch-all deny overrides anything broader in the user's own config. `opencode run` without `--auto` rejects any request that would otherwise prompt, and the relay never passes `--auto`. User-global OpenCode config (providers, models) still loads; project config does not.
 
-Pi has no permission system: its own documentation says to treat model-generated commands as untrusted and to rely on an operating-system or container boundary. The relay therefore never gives a Pi review a shell, and gives an implement run one only on explicit request. Pi's JSON mode exits 0 when a response fails, so the relay reads each assistant message's stop reason rather than trusting the exit code.
+Pi has no permission system: its own documentation says to treat model-generated commands as untrusted and to rely on an operating-system or container boundary. The relay adds one through Pi's extension API: `pi_command_gate.js` handles every `bash` tool call and blocks it unless each part of the command matches an allowed pattern and none matches `git commit *` or `git push *`. It refuses command or process substitution and redirects that write files, which could hide a second command, and it fails closed if its rules are missing. `--no-extensions` still applies to every other extension. Blocked calls appear in `claude.permission_denials`. Pi's JSON mode exits 0 when a response fails, so the relay reads each assistant message's stop reason rather than trusting the exit code.
 
 Neither CLI takes a JSON schema for its answer, so the worker is told to end with the report in a fenced JSON block, and the relay validates it against the same schema Claude uses. A missing or invalid report fails the run.
 

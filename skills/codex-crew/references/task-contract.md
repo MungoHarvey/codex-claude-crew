@@ -12,7 +12,7 @@ Claude starts with none of the Codex conversation. Write the brief for a capable
 | Context | Repo and branch. Files and docs to read first, by path. Applicable `AGENTS.md` and `CLAUDE.md` rules; restricted mode does not load them automatically. What you already know or ruled out. |
 | Scope | Paths to change (implement) or focus on (review). What's off-limits. |
 | Acceptance criteria | Statements Codex can check afterwards. |
-| Checks | Exact commands. Each one needs a matching `--allow` rule, or Claude's attempt is denied. A Pi run has no shell unless `--unscoped-bash` is set. |
+| Checks | Exact commands. Each one needs a matching `--allow` rule, or Claude's attempt is denied. |
 | Limits | Anything the flags don't cover, for example "no new dependencies". |
 
 ```text
@@ -65,7 +65,7 @@ For Claude Code the relay passes a JSON schema with `--json-schema`, so the fina
 | `run_id`, `agent`, `mode`, `cwd` | The run, its worker (`claude`, `pi` or `opencode`; older records without it are `claude`), its mode and the folder the worker worked in |
 | `status` | `completed` requires process success and a valid report. Terminal failures: `error`, `timed_out`, `interrupted`, `claude_unavailable` (Claude CLI missing), `worker_unavailable` (Pi or OpenCode CLI missing). Refused before a run: `claude_incompatible`, `worker_incompatible`. Active/reserved: `queued`, `running`, `stopping`, `orphaned` (stop unconfirmed) |
 | `worktree` | Implement runs: `repo`, `path`, `branch` and the `base` commit |
-| `request` | Effective model, effort, per-invocation limits, `--allow` rules, `unscoped_bash` (Pi), `resume_from`, and explicit `overrides`. Omitted options inherit on resume |
+| `request` | Effective model, effort, per-invocation limits, `--allow` rules, `resume_from`, and explicit `overrides`. Omitted options inherit on resume |
 | `claude` | The worker session, for every worker (the name predates Pi and OpenCode support): session/version, process outcome, turns, models, denials, errors, result text and transcript. `session_cost_usd` is the estimated conversation total; `cost_usd` is its compatibility alias. `cost_delta_usd` is the difference from the latest completed predecessor when known, otherwise null. Pi and OpenCode report what each invocation cost, so for them `cost_delta_usd` is that figure and the session total is baseline plus delta. OpenCode keeps sessions in its database, so `transcript` is null; use `opencode export <session_id>` |
 | `claimed` | Claude's report (above), or `null` if it didn't return one |
 | `observed` | What the relay saw in git: `changed_files`, `commits` added, and `read_only_violation` for review runs |

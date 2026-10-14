@@ -19,9 +19,9 @@ Every worker call goes through `scripts/relay.py` in this skill's folder (`<skil
 |---|---|---|---|
 | `claude` (default) | Claude Code `claude -p` | Read-only git, plus scoped `--allow` rules | turns, budget, timeout |
 | `opencode` | `opencode run` | Read-only git, plus scoped `--allow` rules | turns, timeout |
-| `pi` | `pi --mode json` | None in review. In implement, none unless `--unscoped-bash`, which allows every command | timeout only |
+| `pi` | `pi --mode json` | Read-only git, plus scoped `--allow` rules, enforced by the relay's command gate | timeout only |
 
-Use the worker the user names; otherwise use `claude`. Pick `opencode` or `pi` when the user wants another model provider or a second opinion from a different agent. Pi cannot limit shell commands, so prefer `opencode` when an implement run needs checks such as `npm test`; use `pi --unscoped-bash` only when the user accepts an unrestricted shell in the worktree. The relay refuses limits a worker cannot enforce (`--max-budget-usd` on Pi and OpenCode, `--max-turns` on Pi) rather than recording them as if they held.
+Use the worker the user names; otherwise use `claude`. Pick `opencode` or `pi` when the user wants another model provider or a second opinion from a different agent. Pi has no permission system of its own, so the relay loads a small extension that blocks any shell command outside the run's rules; it also blocks chained commands with a part outside the rules, command substitution and redirects that write files. The relay refuses limits a worker cannot enforce (`--max-budget-usd` on Pi and OpenCode, `--max-turns` on Pi) rather than recording them as if they held.
 
 Models: Claude takes aliases (`sonnet`). Pi and OpenCode take `provider/model`, for example `anthropic/claude-sonnet-5-5`; list them with `pi --list-models` or `opencode models`. `--effort` maps to Pi's `--thinking` and OpenCode's `--variant`.
 
@@ -38,7 +38,7 @@ Claude needs network and credential access. Follow the host's configured permiss
 | `review` | Reviews, bug hunts, questions about the code | Read files, run read-only git commands | `--cwd` (default: current folder). No edits. |
 | `implement` | A focused change with clear acceptance criteria | Also edit files and run the commands you `--allow` | A new git worktree on branch `crew/<name>` |
 
-Start with `review` unless the user wants Claude to write code. Delegate substantial, self-contained tasks. A small fix is faster to do yourself. A Pi review has no shell, so read-only git commands are unavailable; name the files to read in the brief.
+Start with `review` unless the user wants Claude to write code. Delegate substantial, self-contained tasks. A small fix is faster to do yourself.
 
 ## 1. Write the brief
 
@@ -78,7 +78,7 @@ python3 <skill-dir>/scripts/relay.py run --worker opencode --mode implement --cw
 EOF
 ```
 
-- `--allow RULE` (repeatable) lets Claude run a command without asking, for example `"Bash(pytest *)"`. Add one for every authorized check. Broad forms such as `Bash` and `Bash(*)` are refused. Shell permissions are not an OS sandbox; choose commands consistent with the mode and owned scope. OpenCode receives the same rules as bash patterns. Pi refuses `Bash(...)` rules unless you also pass `--unscoped-bash`.
+- `--allow RULE` (repeatable) lets Claude run a command without asking, for example `"Bash(pytest *)"`. Add one for every authorized check. Broad forms such as `Bash` and `Bash(*)` are refused. Shell permissions are not an OS sandbox; choose commands consistent with the mode and owned scope. OpenCode receives the same rules as bash patterns, and Pi's command gate enforces them.
 - `--max-turns` (default 50), `--max-budget-usd` and `--timeout` (seconds, default 1800) limit each invocation. A budget is a client-side estimate, not a strict billing ceiling or an aggregate task budget.
 - `--base REF` starts the worktree from another commit (default `HEAD`). The user's uncommitted changes are not in the worktree.
 
