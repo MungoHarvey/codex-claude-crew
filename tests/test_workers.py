@@ -81,7 +81,7 @@ class PiWorkerTests(WorkerHarness):
         self.assertEqual(Path(self.flag(argv, "--extension")), GATE.resolve())
         self.assertEqual(json.loads(call["rules"]), {
             "allow": ["git diff *", "git log *", "git show *", "git status *", "git blame *"],
-            "deny": ["git commit *", "git push *"]})
+            "deny": ["git commit *", "git push *"], "marker": "codex-crew: command not allowed"})
         self.assertEqual(self.flag(argv, "--thinking"), "high")
         for isolation in ("--no-extensions", "--no-skills", "--no-context-files", "--no-mcp", "--no-approve"):
             self.assertIn(isolation, argv)

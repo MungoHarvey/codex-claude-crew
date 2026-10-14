@@ -1,10 +1,9 @@
 // Pi extension loaded by relay.py (`pi -e`). Pi has no permission rules of its
 // own, so this gate blocks every bash command the run's rules do not allow.
-// The rules arrive in CODEX_CREW_PI_RULES as {"allow": [...], "deny": [...]},
-// using the same patterns as `--allow 'Bash(npm test *)'`. Without them,
-// nothing is allowed.
-
-export const BLOCKED = "codex-crew: command not allowed";
+// The rules arrive in CODEX_CREW_PI_RULES as {"allow": [...], "deny": [...],
+// "marker": "..."}, using the same patterns as `--allow 'Bash(npm test *)'`.
+// The marker starts each block message so the relay can recognise denials.
+// Without rules, nothing is allowed.
 
 // Redirections that cannot write a file; any other `>` is refused.
 const HARMLESS_REDIRECTS = /\s(?:2>&1|[12&]?>\s*\/dev\/null)(?=\s|$)/g;
@@ -28,9 +27,9 @@ export function isAllowed(command, rules) {
 }
 
 export default function (pi) {
-  let rules = { allow: [], deny: [] };
+  let rules = { allow: [], deny: [], marker: "command not allowed" };
   try {
-    rules = JSON.parse(process.env.CODEX_CREW_PI_RULES || "{}");
+    rules = { ...rules, ...JSON.parse(process.env.CODEX_CREW_PI_RULES || "{}") };
   } catch {
     // Unreadable rules leave the empty allow list in place: fail closed.
   }
@@ -38,6 +37,6 @@ export default function (pi) {
     if (event.toolName !== "bash") return undefined;
     const command = String((event.input || {}).command || "");
     if (isAllowed(command, rules)) return undefined;
-    return { block: true, reason: `${BLOCKED}: ${command}` };
+    return { block: true, reason: `${rules.marker}: ${command}` };
   });
 }
