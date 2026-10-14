@@ -31,6 +31,41 @@ class WorkerHarness(RelayHarness):
         return [json.loads(line) for line in self.worker_log.read_text().splitlines()]
 
 
+class WorkersCommandTests(WorkerHarness):
+    def test_reports_every_worker_and_picks_a_default(self):
+        code, report = self.relay("workers", "--pi-model", "anthropic/claude-sonnet-5-5")
+        self.assertEqual(code, 0, report)
+        self.assertTrue(report["host"]["ok"])
+        by_name = {status["worker"]: status for status in report["workers"]}
+        self.assertEqual(set(by_name), {"claude", "pi", "opencode"})
+        self.assertEqual(by_name["claude"]["sign_in"], "confirmed")
+        self.assertEqual(by_name["pi"]["sign_in"], "confirmed")
+        self.assertEqual(by_name["opencode"]["sign_in"], "unchecked")
+        self.assertIn("sign_in_hint", by_name["opencode"])
+        self.assertEqual(report["available"], ["claude", "pi", "opencode"])
+        self.assertEqual(report["default"], "claude")
+        self.assertNotIn("sk-secret", json.dumps(report))
+        self.assertNotIn("someone@example.com", json.dumps(report))
+
+    def test_missing_signed_out_and_old_workers_are_not_available(self):
+        code, report = self.relay("workers", CREW_OPENCODE_BIN=str(self.tmp / "nope"), FAKE_CLAUDE_LOGGED_OUT="1",
+                                  FAKE_WORKER_VERSION="1.1.9")
+        by_name = {status["worker"]: status for status in report["workers"]}
+        self.assertFalse(by_name["opencode"]["found"])
+        self.assertIn("npm install -g opencode-ai", by_name["opencode"]["install"])
+        self.assertEqual(by_name["claude"]["sign_in"], "not_confirmed")
+        self.assertFalse(by_name["claude"]["ready"])
+        self.assertFalse(by_name["pi"]["capabilities"]["restricted_profile"])
+        self.assertEqual(report["available"], [])
+        self.assertIsNone(report["default"])
+        self.assertEqual(code, 1)
+
+    def test_default_falls_back_to_another_worker(self):
+        _, report = self.relay("workers", CLAUDE_CREW_BIN=str(self.tmp / "nope"))
+        self.assertEqual(report["available"], ["pi", "opencode"])
+        self.assertEqual(report["default"], "pi")
+
+
 class PiWorkerTests(WorkerHarness):
     def test_review_uses_read_only_tools_a_gated_shell_and_the_isolated_profile(self):
         code, record = self.relay("run", "--worker", "pi", "--mode", "review", "--model", "anthropic/claude-sonnet-5-5",

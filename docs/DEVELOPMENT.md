@@ -18,6 +18,9 @@ skills/codex-crew/
   agents/openai.yaml            Codex display metadata
   scripts/relay.py              runs the worker (Claude, Pi or OpenCode) and writes the run record
   references/task-contract.md   brief template, report and record fields
+  scripts/pi_command_gate.js    Pi extension that enforces the run's command rules
+skills/codex-crew-setup/
+  SKILL.md                      checks which workers are usable (`relay.py workers`)
 tests/test_runner.py            relay tests against a fake claude (no model calls)
 tests/test_workers.py           relay tests against fake pi and opencode CLIs
 ```

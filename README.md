@@ -12,7 +12,13 @@ Requires Codex, at least one authenticated worker CLI (Claude Code, Pi or OpenCo
 npx skills add MungoHarvey/codex-claude-crew --skill codex-crew --agent codex -g
 ```
 
-Omit `-g` to install into the current project only. Then start a new Codex thread and type `$codex-crew`.
+Omit `-g` to install into the current project only. To check which workers this machine can run, also install the setup skill:
+
+```bash
+npx skills add MungoHarvey/codex-claude-crew --skill codex-crew-setup --agent codex -g
+```
+
+Then start a new Codex thread and type `$codex-crew-setup` to see which of Claude Code, Pi and OpenCode are ready, or `$codex-crew` to hand off a task.
 
 ## Use
 

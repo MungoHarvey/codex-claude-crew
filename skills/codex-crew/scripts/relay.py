@@ -11,6 +11,7 @@ Codex's own verification.
 Standard library only. macOS and Linux.
 
   relay.py preflight [--worker W]       check the worker CLI and sign-in (no model call)
+  relay.py workers                      check which of claude, pi and opencode are usable
   relay.py run --mode review ...        start a run (see `relay.py run --help`)
   relay.py status RUN [--wait SECONDS]  print a run record
   relay.py list [--limit N] [--thread]  list recent runs
@@ -1137,17 +1138,23 @@ def other_auth(kind, binary, model, notes):
         return None
 
 
-def cmd_preflight(args):
-    kind = args.worker
-    binary = worker_bin(kind)
-    report = {
-        "ok": False, "worker": kind, "binary": binary, "version": None, "auth": None,
-        "git": shutil.which("git"), "python": platform.python_version(),
-        "state_dir": str(crew_home()), "state_writable": False,
-        "capabilities": None, "process_inspection": False, "notes": [],
-    }
-    if kind == "claude":
-        report["claude"] = binary  # earlier name of `binary`, kept for existing callers
+# What to tell the user when a worker is missing or signed out.
+INSTALL_HINTS = {
+    "claude": "Install Claude Code: https://code.claude.com/docs/en/getting-started",
+    "pi": "npm install -g @earendil-works/pi-coding-agent",
+    "opencode": "npm install -g opencode-ai",
+}
+SIGN_IN_HINTS = {
+    "claude": "Run `claude` once and sign in.",
+    "pi": "Run `pi` and use /login, or set the provider's API key (e.g. ANTHROPIC_API_KEY).",
+    "opencode": "Run `opencode providers login`, then check with `opencode providers list`.",
+}
+
+
+def host_status():
+    """Checks shared by every worker: git, state folder and process inspection."""
+    report = {"git": shutil.which("git"), "python": platform.python_version(),
+              "state_dir": str(crew_home()), "state_writable": False, "process_inspection": False, "notes": []}
     try:
         crew_home().mkdir(parents=True, exist_ok=True, mode=0o700)
         with tempfile.TemporaryFile(dir=crew_home()) as probe:
@@ -1159,36 +1166,80 @@ def cmd_preflight(args):
         report["process_inspection"] = process_identity(os.getpid()) is not None
     except (OSError, Fail, subprocess.SubprocessError):
         report["notes"].append("Process inspection with ps is required for safe cancellation.")
+    if not report["git"]:
+        report["notes"].append("git is required for worktrees and the read-only tripwire.")
+    report["ok"] = bool(report["git"] and report["state_writable"] and report["process_inspection"])
+    return report
+
+
+def worker_status(kind, model=None):
+    """One worker's CLI, version, profile flags and sign-in, without a model call.
+
+    `sign_in` is confirmed, not_confirmed, or unchecked (OpenCode, and Pi without
+    a model, have no sign-in check). Only not_confirmed makes a worker not ready.
+    """
+    binary = worker_bin(kind)
+    status = {"worker": kind, "found": bool(binary), "binary": binary, "version": None,
+              "capabilities": None, "auth": None, "sign_in": "unchecked", "ready": False, "notes": []}
     if not binary:
-        report["notes"].append(f"{kind} not found. Install it and sign in, or set {WORKER_BIN_ENV[kind]}.")
-        return emit(report, 127)
-    caps = report["capabilities"] = capabilities(binary, kind)
-    report["version"] = caps["version"]
+        status["notes"].append(f"{kind} not found. {INSTALL_HINTS[kind]}, or set {WORKER_BIN_ENV[kind]}.")
+        return status
+    caps = status["capabilities"] = capabilities(binary, kind)
+    status["version"] = caps["version"]
     if not caps["restricted_profile"]:
-        report["notes"].append(f"{kind} {caps['minimum_version']}+ with the relay's profile flags is required. "
+        status["notes"].append(f"{kind} {caps['minimum_version']}+ with the relay's profile flags is required. "
                                "Update it; no weaker fallback is used.")
     if kind == "claude":
         try:
             proc = subprocess.run([binary, "auth", "status", "--json"], capture_output=True, text=True, timeout=30)
             data = json.loads(proc.stdout)
-            report["auth"] = {key: data.get(key) for key in ("loggedIn", "authMethod", "apiProvider", "subscriptionType")}
+            status["auth"] = {key: data.get(key) for key in ("loggedIn", "authMethod", "apiProvider", "subscriptionType")}
             if proc.returncode:
-                report["auth"]["loggedIn"] = False
+                status["auth"]["loggedIn"] = False
         except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
-            report["notes"].append("Could not read claude auth status.")
+            status["notes"].append("Could not read claude auth status.")
+            status["auth"] = {"loggedIn": None}
     else:
-        report["auth"] = other_auth(kind, binary, args.model, report["notes"])
-    if not report["git"]:
-        report["notes"].append("git is required for worktrees and the read-only tripwire.")
-    logged_in = (report["auth"] or {}).get("loggedIn") is True
-    # Pi without --model and OpenCode cannot confirm sign-in here; they do not block.
-    auth_ok = logged_in or (kind != "claude" and report["auth"] is None)
-    if not auth_ok:
-        report["notes"].append(f"{kind} did not confirm authentication. Check credentials and network/keychain "
-                               "access under the host's permission policy.")
-    report["ok"] = all((caps["restricted_profile"], auth_ok, report["git"],
-                        report["state_writable"], report["process_inspection"]))
+        status["auth"] = other_auth(kind, binary, model, status["notes"])
+    if status["auth"] is not None:
+        status["sign_in"] = "confirmed" if status["auth"].get("loggedIn") is True else "not_confirmed"
+    if status["sign_in"] == "not_confirmed":
+        status["notes"].append(f"{kind} did not confirm authentication. {SIGN_IN_HINTS[kind]} Check credentials and "
+                               "network/keychain access under the host's permission policy.")
+    status["ready"] = caps["restricted_profile"] and status["sign_in"] != "not_confirmed"
+    return status
+
+
+def cmd_preflight(args):
+    kind = args.worker
+    host, status = host_status(), worker_status(kind, args.model)
+    report = {
+        "ok": False, "worker": kind, "binary": status["binary"], "version": status["version"], "auth": status["auth"],
+        "git": host["git"], "python": host["python"], "state_dir": host["state_dir"],
+        "state_writable": host["state_writable"], "capabilities": status["capabilities"],
+        "process_inspection": host["process_inspection"], "notes": host["notes"] + status["notes"],
+    }
+    if kind == "claude":
+        report["claude"] = status["binary"]  # earlier name of `binary`, kept for existing callers
+    if not status["found"]:
+        return emit(report, 127)
+    report["ok"] = bool(host["ok"] and status["ready"])
     return emit(report, 0 if report["ok"] else 1)
+
+
+def cmd_workers(args):
+    """Which workers this machine can run, for setup and for choosing a worker."""
+    host = host_status()
+    workers = [worker_status(kind, args.pi_model if kind == "pi" else None) for kind in WORKERS]
+    for status in workers:
+        if not status["found"]:
+            status["install"] = INSTALL_HINTS[status["worker"]]
+        elif status["sign_in"] != "confirmed":
+            status["sign_in_hint"] = SIGN_IN_HINTS[status["worker"]]
+    available = [status["worker"] for status in workers if status["ready"]] if host["ok"] else []
+    report = {"ok": bool(available), "host": host, "workers": workers, "available": available,
+              "default": "claude" if "claude" in available else (available[0] if available else None)}
+    return emit(report, 0 if available else 1)
 
 
 def resolve_dir(value):
@@ -1482,6 +1533,9 @@ def build_parser():
     preflight.add_argument("--worker", choices=WORKERS, default="claude")
     preflight.add_argument("--model", help="pi: the model whose provider credentials to check")
 
+    workers = sub.add_parser("workers", help="check every worker CLI (claude, pi, opencode) without a model call")
+    workers.add_argument("--pi-model", help="the model whose provider credentials Pi should check")
+
     run = sub.add_parser("run", help="start a review or implement run")
     run.add_argument("--worker", choices=WORKERS, help="claude (default), pi or opencode; resumes keep their worker")
     run.add_argument("--mode", choices=("review", "implement"))
@@ -1529,6 +1583,7 @@ def build_parser():
 
 COMMANDS = {
     "preflight": cmd_preflight,
+    "workers": cmd_workers,
     "run": cmd_run,
     "status": cmd_status,
     "list": cmd_list,

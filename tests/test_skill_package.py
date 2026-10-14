@@ -12,10 +12,16 @@ import yaml
 from test_runner import ROOT, RelayHarness
 
 SKILL = ROOT / 'skills' / 'codex-crew'
+SETUP = ROOT / 'skills' / 'codex-crew-setup'
 
 
 class SkillPackageTests(RelayHarness):
     def test_frontmatter_and_ui_metadata(self):
+        for skill in (SKILL, SETUP):
+            with self.subTest(skill=skill.name):
+                self.check_skill(skill)
+
+    def check_skill(self, SKILL):
         text = (SKILL / 'SKILL.md').read_text()
         self.assertTrue(text.startswith('---\n'))
         frontmatter = yaml.safe_load(text.split('---', 2)[1])

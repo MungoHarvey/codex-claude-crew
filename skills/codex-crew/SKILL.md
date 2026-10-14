@@ -27,6 +27,8 @@ Models: Claude takes aliases (`sonnet`). Pi and OpenCode take `provider/model`, 
 
 ## Setup, once per session
 
+If the user hasn't named a worker, `python3 <skill-dir>/scripts/relay.py workers` lists which of `claude`, `pi` and `opencode` are usable here and which is the default, without a model call. For installing or signing in to a worker, use the `codex-crew-setup` skill.
+
 Run `python3 <skill-dir>/scripts/relay.py preflight`, adding `--worker pi` or `--worker opencode` for those workers (Pi also takes `--model` to check that provider's sign-in). It checks CLI capabilities, authentication, process inspection and state-directory access without calling a model. If `ok` is false, resolve the reported prerequisites before delegating. Do not fall back to a weaker permission profile. OpenCode, and Pi without `--model`, cannot confirm sign-in here; a run reports the failure if credentials are missing.
 
 Claude needs network and credential access. Follow the host's configured permission policy; request additional access only when required and supported. Local record commands do not need Claude authentication or network access.
