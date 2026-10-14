@@ -149,10 +149,48 @@ CASES = {
         "The final answer says OpenCode is not installed / not found":
             lambda r: check(says(r.answer, r"opencode[^\n]{0,80}(not (installed|found|on (your )?path)|missing|isn.?t installed)|"
                                            r"(not installed|not found|missing)[^\n]{0,80}opencode"), r.answer[:300] or "no answer"),
-        "The final answer includes 'npm install -g opencode-ai'":
-            lambda r: check("npm install -g opencode-ai" in r.answer, r.answer[:300] or "no answer"),
+        "The final answer includes an OpenCode install command":
+            lambda r: check(says(r.answer, r"npm\s+(install|i)\s+(--global|-g)?\s*@?opencode-ai(@latest)?"),
+                            r.answer[:300] or "no answer"),
         "No npm install command was executed (transcript)":
-            lambda r: check(not says(r.transcript, r"^\s*[-*\d.`]*\s*(\. \S+ && )?npm install"), r.transcript[:300] or "no transcript"),
+            lambda r: check(not says(r.transcript, r"^\s*[-*\d.`]*\s*(\. \S+ && )?npm\s+(install|i)\b"), r.transcript[:300] or "no transcript"),
+    },
+    ("codex-crew-setup", 3, "pi-missing-opencode-available-choice"): {
+        "relay.py workers was run (visible in transcript)":
+            lambda r: check(says(r.transcript, r"relay\.py\S*\s+workers"), r.transcript[:300] or "no transcript"),
+        "The final answer reports Pi as missing and OpenCode as ready/available":
+            lambda r: check(says(r.answer, r"pi.{0,80}(missing|not (installed|found|ready))",
+                                 r"opencode.{0,80}(ready|available|installed)"), r.answer[:400] or "no answer"),
+        "The final answer offers installing Pi or using OpenCode and asks the user to choose":
+            lambda r: check(says(r.answer, r"install.{0,80}pi", r"use.{0,80}opencode",
+                                 r"would you|which (worker|option)|prefer"), r.answer[:400] or "no answer"),
+        "No npm install command was executed (transcript)":
+            lambda r: check(not says(r.transcript, r"^\s*(\. \S+ && )?npm\s+(install|i)\b"), r.transcript[:300] or "no transcript"),
+        "No relay run record exists (no live worker call)":
+            lambda r: check(not r.records, f"{len(r.records)} records"),
+    },
+    ("codex-crew-setup", 4, "both-missing-asks-worker-choice"): {
+        "relay.py workers was run (visible in transcript)":
+            lambda r: check(says(r.transcript, r"relay\.py\S*\s+workers"), r.transcript[:300] or "no transcript"),
+        "The final answer reports both Pi and OpenCode as missing":
+            lambda r: check(says(r.answer, r"pi.{0,80}(missing|not (installed|found|ready))",
+                                 r"opencode.{0,80}(missing|not (installed|found|ready))"), r.answer[:400] or "no answer"),
+        "The final answer recommends Pi and asks which worker to install":
+            lambda r: check(says(r.answer, r"recommend.{0,50}pi|prefer.{0,50}pi",
+                                 r"which (worker|one)|would you (like|prefer)|choose"), r.answer[:400] or "no answer"),
+        "No npm install command was executed (transcript)":
+            lambda r: check(not says(r.transcript, r"^\s*(\. \S+ && )?npm\s+(install|i)\b"), r.transcript[:300] or "no transcript"),
+        "No relay run record exists (no live worker call)":
+            lambda r: check(not r.records, f"{len(r.records)} records"),
+    },
+    ("codex-crew-setup", 5, "both-ready-prefers-pi"): {
+        "relay.py workers was run (visible in transcript)":
+            lambda r: check(says(r.transcript, r"relay\.py\S*\s+workers"), r.transcript[:300] or "no transcript"),
+        "The final answer selects or recommends Pi as the preferred worker":
+            lambda r: check(says(r.answer, r"(select|choose|recommend|prefer).{0,60}pi|pi.{0,40}(preferred|choice)"),
+                            r.answer[:400] or "no answer"),
+        "The final answer does not start a live worker run":
+            lambda r: check(not r.records, f"{len(r.records)} records"),
     },
 }
 

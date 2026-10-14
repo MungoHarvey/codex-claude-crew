@@ -1,6 +1,6 @@
 {
   "skill_name": "codex-crew-setup",
-  "notes": "Run each case in an isolated sandbox whose PATH puts fake claude, pi and opencode CLIs first (tests/fixtures/fake_*.py); case 2 removes opencode from the sandbox. No model is called.",
+  "notes": "Run each case in an isolated sandbox whose PATH puts fake claude, pi and opencode CLIs first (tests/fixtures/fake_*.py); cases 2-4 remove one or more workers from the sandbox. No worker model is called.",
   "evals": [
     {
       "id": 1,
@@ -20,12 +20,51 @@
       "name": "missing-opencode-install-advice",
       "prompt": "I want to use OpenCode with codex-crew. Is it set up?",
       "missing_workers": ["opencode"],
-      "expected_output": "The agent finds OpenCode missing and gives the install command without running it.",
+      "expected_output": "The agent finds OpenCode missing and asks before installing it, giving the install command without running it.",
       "assertions": [
         "relay.py workers or preflight --worker opencode was run",
         "The final answer says OpenCode is not installed / not found",
-        "The final answer includes 'npm install -g opencode-ai'",
+        "The final answer includes an OpenCode install command",
         "No npm install command was executed (transcript)"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "pi-missing-opencode-available-choice",
+      "prompt": "Set up a codex-crew worker for me. I prefer Pi, but tell me my options before you install anything.",
+      "missing_workers": ["pi"],
+      "expected_output": "The agent reports Pi missing and OpenCode available, then asks whether to install Pi or use OpenCode. It installs nothing until the user chooses.",
+      "assertions": [
+        "relay.py workers was run (visible in transcript)",
+        "The final answer reports Pi as missing and OpenCode as ready/available",
+        "The final answer offers installing Pi or using OpenCode and asks the user to choose",
+        "No npm install command was executed (transcript)",
+        "No relay run record exists (no live worker call)"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "both-missing-asks-worker-choice",
+      "prompt": "Help me set up codex-crew; I haven't chosen between Pi and OpenCode.",
+      "missing_workers": ["pi", "opencode"],
+      "expected_output": "The agent reports both missing, recommends Pi, and asks which CLI to install before running npm.",
+      "assertions": [
+        "relay.py workers was run (visible in transcript)",
+        "The final answer reports both Pi and OpenCode as missing",
+        "The final answer recommends Pi and asks which worker to install",
+        "No npm install command was executed (transcript)",
+        "No relay run record exists (no live worker call)"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "both-ready-prefers-pi",
+      "prompt": "Set up my codex-crew worker. I have no preference.",
+      "expected_output": "The agent checks worker readiness and selects Pi by default without starting a live run.",
+      "assertions": [
+        "relay.py workers was run (visible in transcript)",
+        "The final answer selects or recommends Pi as the preferred worker",
+        "The final answer does not start a live worker run"
       ]
     }
   ]

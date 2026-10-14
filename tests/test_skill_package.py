@@ -16,6 +16,31 @@ SETUP = ROOT / 'skills' / 'codex-crew-setup'
 
 
 class SkillPackageTests(RelayHarness):
+    def test_setup_skill_has_pi_first_opt_in_install_flow(self):
+        text = (SETUP / 'SKILL.md').read_text()
+        self.assertIn('prefer Pi', text)
+        self.assertIn('ask whether the user wants to install/update Pi', text)
+        self.assertIn('or use OpenCode now', text)
+        self.assertIn('Do not run a global install until the user confirms', text)
+        self.assertIn('npm install --global @earendil-works/pi-coding-agent', text)
+        self.assertIn('npm install --global opencode-ai', text)
+        self.assertIn('Do not test a model', text)
+        self.assertNotIn('ELM', text.upper())
+
+    def test_codex_plugin_manifest_and_local_marketplace(self):
+        plugin_path = ROOT / '.codex-plugin' / 'plugin.json'
+        plugin = json.loads(plugin_path.read_text())
+        self.assertEqual(plugin['name'], 'codex-crew')
+        self.assertEqual(plugin['skills'], './skills/')
+        self.assertTrue((ROOT / plugin['skills']).is_dir())
+
+        marketplace_path = ROOT / '.agents' / 'plugins' / 'marketplace.json'
+        marketplace = json.loads(marketplace_path.read_text())
+        self.assertEqual(marketplace['name'], 'codex-crew-local')
+        self.assertEqual([item['name'] for item in marketplace['plugins']], ['codex-crew'])
+        self.assertEqual(marketplace['plugins'][0]['source']['source'], 'local')
+        self.assertEqual(marketplace['plugins'][0]['source']['path'], './')
+
     def test_frontmatter_and_ui_metadata(self):
         for skill in (SKILL, SETUP):
             with self.subTest(skill=skill.name):

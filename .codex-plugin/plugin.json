@@ -1,0 +1,30 @@
+{
+  "name": "codex-crew",
+  "version": "0.1.2",
+  "description": "Delegate bounded coding tasks to local headless coding-agent workers and verify their results.",
+  "author": {
+    "name": "Mungo Harvey",
+    "url": "https://github.com/MungoHarvey"
+  },
+  "homepage": "https://github.com/MungoHarvey/codex-claude-crew",
+  "repository": "https://github.com/MungoHarvey/codex-claude-crew",
+  "license": "MIT",
+  "keywords": [
+    "coding-agents",
+    "delegation",
+    "claude-code",
+    "pi",
+    "opencode"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Crew",
+    "shortDescription": "Delegate bounded tasks to local coding-agent workers",
+    "longDescription": "Delegate bounded review or implementation tasks to Claude Code, Pi, or OpenCode, then independently verify the worker's claims.",
+    "developerName": "Mungo Harvey",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "defaultPrompt": "Use $codex-crew to delegate a bounded task to a local coding-agent worker, then verify the result.",
+    "websiteURL": "https://github.com/MungoHarvey/codex-claude-crew"
+  }
+}

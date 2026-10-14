@@ -1,0 +1,21 @@
+{
+  "name": "codex-crew-local",
+  "interface": {
+    "displayName": "Codex Crew (Local)"
+  },
+  "plugins": [
+    {
+      "name": "codex-crew",
+      "version": "0.1.2",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

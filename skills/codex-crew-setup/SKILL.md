@@ -1,15 +1,15 @@
 ---
 name: codex-crew-setup
-description: Check which coding-agent workers (Claude Code, Pi, OpenCode) this machine can run for codex-crew, then help the user install or sign in to the ones they want. Use when the user sets up codex-crew, asks which workers or agents are available, or a codex-crew preflight fails.
+description: Check whether Pi or OpenCode is ready for codex-crew, prefer Pi when the user has no preference, and help install the user's choice if needed. Use when setting up codex-crew or when its worker preflight fails.
 license: MIT
 compatibility: Requires the codex-crew skill installed alongside this one, Python 3.9+, git and ps on macOS or Linux.
 metadata:
-  version: "0.1.0"
+  version: "0.1.2"
 ---
 
 # Codex Crew Setup
 
-Find out which workers codex-crew can hand tasks to on this machine, and get the missing ones working. This skill only checks and advises. The user installs software and signs in.
+Check whether Pi or OpenCode is available for codex-crew, prefer Pi when the user has no preference, and offer to install the chosen worker if it is missing. Installing a global CLI changes the user's machine: ask first and wait for their choice/confirmation before running an install command. Do not configure provider-specific endpoints or credentials as part of this setup.
 
 ## 1. Find the relay
 
@@ -19,13 +19,13 @@ The relay lives in the codex-crew skill, normally next to this skill's folder: `
 npx skills add MungoHarvey/codex-claude-crew --skill codex-crew --agent codex -g
 ```
 
-## 2. Check the workers
+## 2. Check Pi and OpenCode first
 
 ```bash
 python3 <relay> workers
 ```
 
-This makes no model call and uses no credits. If the user names a Pi model, add `--pi-model <provider/model>` so Pi can check that provider's sign-in.
+This makes no model call and uses no credits. It checks all supported worker CLIs; focus the setup decision on Pi and OpenCode. If the user names a Pi model, add `--pi-model <provider/model>` so Pi can check that provider's sign-in. Check `host.ok` before proceeding: if it is false, explain the host prerequisite and stop rather than installing a CLI that this relay cannot run. If the command errors before returning JSON, treat that as a relay/host prerequisite failure and stop; don't install a worker to work around it.
 
 It prints JSON:
 
@@ -36,34 +36,27 @@ It prints JSON:
   - `sign_in`: `confirmed`, `not_confirmed`, or `unchecked`. OpenCode, and Pi without `--pi-model`, cannot report sign-in without a model call, so they read `unchecked`.
   - `ready`: codex-crew can run it. `unchecked` sign-in still counts as ready; the first run reports missing credentials.
   - `install` and `sign_in_hint`: what to tell the user.
-- `available`: the ready workers. `default`: the one codex-crew will use when the user names none.
+- `available`: the ready workers. Codex Crew's runtime default is Claude when available, but this setup skill prefers Pi when the user has not named a worker. If Pi is not ready and OpenCode is ready, offer/use OpenCode rather than silently choosing another worker.
 
-## 3. Report
+## 3. Choose a worker and ask before installing
 
-Show one row per worker: found and version, sign-in, ready. Then say which workers are available and which is the default. Keep `install` and sign-in advice to the workers the user wants.
+- If the user named Pi or OpenCode, use that choice. Otherwise prefer ready Pi.
+- If Pi is missing or not ready but OpenCode is ready, ask whether the user wants to install/update Pi (the preferred option) or use OpenCode now; don't choose OpenCode for them.
+- If the chosen worker is missing or too old, ask whether the user wants it installed/updated. When both Pi and OpenCode are missing and the user has no preference, recommend Pi and ask whether they want Pi or OpenCode. Do not run a global install until the user confirms which one.
+- Check that `npm` is available before offering an npm install. If it is missing, report that prerequisite; do not install Node.js as a side effect.
+- Install only the selected worker, using its documented package:
+  - Pi: `npm install --global @earendil-works/pi-coding-agent`
+  - OpenCode: `npm install --global opencode-ai`
+- After installation/update, repeat `workers` and verify the chosen worker's version and `capabilities.restricted_profile`. Report the actual result; if it remains unavailable or incompatible, stop and give the reported error rather than guessing at a fix.
 
-## 4. Fix what the user asks for
+## 4. Sign in and report
 
-- **Missing or too old:** give the `install` command, or the update command for an old version. Run an install only when the user asks you to; global installs change their machine.
-- **Not signed in:** give the `sign_in_hint`. Sign-in is interactive and stores credentials, so the user does it in their own terminal.
-- **A CLI outside PATH:** point codex-crew at it with `CLAUDE_CREW_BIN`, `CREW_PI_BIN` or `CREW_OPENCODE_BIN`.
-
-After each fix, run `workers` again and report the change.
-
-## 5. Optional live check
-
-Only when the user asks, and after saying it uses their model credits, run one small review per worker they want to confirm:
-
-```bash
-python3 <relay> run --worker <worker> --mode review --timeout 120 --brief - <<'EOF'
-Goal: Confirm you can read this repository. Read README.md and report one sentence about it.
-EOF
-```
-
-Add `--model <provider/model>` for Pi and OpenCode if they have no configured default. `status: completed` with a `claimed` report means the worker works end to end. Otherwise report `error`.
+- If Pi's sign-in is not confirmed, tell the user to start `pi` and use its `/login` flow, or follow the chosen provider's own credential setup. If OpenCode needs authentication, use the relay's `sign_in_hint` (currently `opencode providers login`). Sign-in is interactive and stores credentials; do not run it on the user's behalf unless they explicitly ask.
+- Never print, copy, request, or place credentials or API keys into config files. Do not test a model or make a paid/network model call unless the user explicitly asks; explain that a live smoke test may use their provider quota first.
+- Show a concise status for Pi and OpenCode (found/version, profile compatibility, sign-in state, ready), identify the selected worker, and distinguish confirmed facts from unchecked authentication.
 
 ## Rules
 
-- Never print, copy or ask for credentials or API keys.
-- Don't install software, sign in, or edit a worker's own configuration on the user's behalf unless they ask.
+- Do not edit a worker's provider/model configuration as part of setup unless the user asks for that configuration specifically.
+- If a CLI is installed outside PATH, explain how to set `CREW_PI_BIN` or `CREW_OPENCODE_BIN`; don't modify shell profiles without permission.
 - Don't treat `unchecked` sign-in as confirmed when you report.

@@ -4,21 +4,35 @@ A Codex skill that hands bounded tasks to a local coding-agent worker (Claude Co
 
 Codex writes the brief, the worker reviews code or implements changes in a separate git worktree, and Codex verifies the result.
 
-## Install
+## Install as a Codex plugin
+
+From the repository root, register the local marketplace and install the plugin:
+
+```bash
+codex plugin marketplace add .
+codex plugin add codex-crew --marketplace codex-crew-local
+```
+
+Restart Codex (or start a new thread) and invoke `$codex-crew` or `$codex-crew-setup`.
+The plugin packages both skills and their relay scripts.
+
+## Install individual skills
 
 Requires Codex, at least one authenticated worker CLI (Claude Code, Pi or OpenCode), Python and git on macOS or Linux. See [requirements and supported versions](docs/VERSIONS.md#requirements).
+
+Cursor Agent is not currently a supported relay worker. Although its CLI is available on some machines, this project does not yet have a Cursor adapter; the relay also depends on POSIX process and file-locking APIs and does not run natively on Windows.
 
 ```bash
 npx skills add MungoHarvey/codex-claude-crew --skill codex-crew --agent codex -g
 ```
 
-Omit `-g` to install into the current project only. To check which workers this machine can run, also install the setup skill:
+Omit `-g` to install into the current project only. Install the setup skill too if you want it to check for Pi and OpenCode, recommend Pi when you have no preference, and ask before installing your choice:
 
 ```bash
 npx skills add MungoHarvey/codex-claude-crew --skill codex-crew-setup --agent codex -g
 ```
 
-Then start a new Codex thread and type `$codex-crew-setup` to see which of Claude Code, Pi and OpenCode are ready, or `$codex-crew` to hand off a task.
+Then start a new Codex thread and type `$codex-crew-setup` to check Pi and OpenCode and walk through installing your chosen worker if needed, or `$codex-crew` to hand off a task.
 
 ## Use
 
