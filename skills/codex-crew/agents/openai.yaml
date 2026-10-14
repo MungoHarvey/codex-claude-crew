@@ -1,7 +1,7 @@
 interface:
-  display_name: "Claude Crew"
+  display_name: "Codex Crew"
   short_description: "Delegate tasks to Claude Code, Pi or OpenCode and verify"
-  default_prompt: "Use $codex-claude-crew to have Claude Code review my current changes, then check its findings yourself."
+  default_prompt: "Use $codex-crew to have Claude Code review my current changes, then check its findings yourself."
   icon_small: "./assets/icon-small.png"
   icon_large: "./assets/icon-large.png"
 

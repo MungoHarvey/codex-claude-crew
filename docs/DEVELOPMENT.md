@@ -5,15 +5,15 @@
 From the repository root, link the skill folder so edits are live:
 
 ```bash
-ln -s "$PWD/skills/codex-claude-crew" ~/.agents/skills/codex-claude-crew
+ln -s "$PWD/skills/codex-crew" ~/.agents/skills/codex-crew
 ```
 
-Then start a new Codex thread and type `$codex-claude-crew`.
+Then start a new Codex thread and type `$codex-crew`.
 
 ## Layout
 
 ```text
-skills/codex-claude-crew/
+skills/codex-crew/
   SKILL.md                      when to delegate, how to scope, how to verify
   agents/openai.yaml            Codex display metadata
   scripts/relay.py              runs the worker (Claude, Pi or OpenCode) and writes the run record

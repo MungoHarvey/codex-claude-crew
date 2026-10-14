@@ -11,7 +11,7 @@ import yaml
 
 from test_runner import ROOT, RelayHarness
 
-SKILL = ROOT / 'skills' / 'codex-claude-crew'
+SKILL = ROOT / 'skills' / 'codex-crew'
 
 
 class SkillPackageTests(RelayHarness):

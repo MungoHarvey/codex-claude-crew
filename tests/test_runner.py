@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-RELAY = ROOT / "skills" / "codex-claude-crew" / "scripts" / "relay.py"
+RELAY = ROOT / "skills" / "codex-crew" / "scripts" / "relay.py"
 FAKE_CLAUDE = ROOT / "tests" / "fixtures" / "fake_claude.py"
 
 

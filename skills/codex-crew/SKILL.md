@@ -1,5 +1,5 @@
 ---
-name: codex-claude-crew
+name: codex-crew
 description: Hand a bounded review or implementation task to a local coding-agent worker running headless (Claude Code by default, or Pi or OpenCode), then verify the result yourself. Use when the user asks to delegate work to Claude, Claude Code, Pi or OpenCode, wants a worker's review or a second opinion, or wants a worker to implement a change in a separate git worktree. Not for tasks the user wants you to do directly.
 license: MIT
 compatibility: Requires at least one authenticated worker CLI (Claude Code 2.1.259+, Pi 1.2.0+ or OpenCode 1.19.0+), Python 3.9+, git and ps on macOS or Linux. Network and credential access follow the host's permission policy.
@@ -7,7 +7,7 @@ metadata:
   version: "0.1.0"
 ---
 
-# Codex Claude Crew
+# Codex Crew
 
 You stay in charge. The worker (Claude Code, Pi or OpenCode) has its own context and tool loop. You scope the task, the worker does it, and you check the result. The worker's report is a claim. Only your own checks confirm it.
 

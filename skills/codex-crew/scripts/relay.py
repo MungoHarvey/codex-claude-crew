@@ -145,7 +145,7 @@ REPORT_SCHEMA = {
 
 # Appended to Claude Code's system prompt, so the brief can stay about the task.
 WORKER_RULES = """\
-You are a worker session started by Codex, another coding agent, through codex-claude-crew. \
+You are a worker session started by Codex, another coding agent, through codex-crew. \
 Nobody is watching this session: no one can answer questions or approve permission prompts.
 - Work only on the task in the brief, inside the working directory.
 - Do not commit, push, rebase, reset or switch branches. Codex reviews and lands the work.
@@ -191,6 +191,8 @@ def emit(payload, code=0):
 
 
 def crew_home():
+    # The folder, env var and record schema keep their codex-claude-crew names so
+    # runs and worktrees from before the codex-crew rename stay visible.
     return Path(os.environ.get("CLAUDE_CREW_HOME") or Path.home() / ".codex-claude-crew").expanduser().resolve()
 
 
@@ -361,7 +363,7 @@ def opencode_agent(record):
     for tool in ("WebFetch", "WebSearch"):
         if tool in request["allow"]:
             permission[tool.lower()] = "allow"
-    return {"mode": "primary", "description": f"codex-claude-crew {mode} worker",
+    return {"mode": "primary", "description": f"codex-crew {mode} worker",
             "steps": request["max_turns"], "permission": permission}
 
 
