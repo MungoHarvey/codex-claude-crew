@@ -4,7 +4,7 @@ description: Check whether Pi or OpenCode is ready for codex-crew, prefer Pi whe
 license: MIT
 compatibility: Requires the codex-crew skill installed alongside this one, Python 3.9+, git and ps on macOS or Linux.
 metadata:
-  version: "0.1.2"
+  version: "0.1.3"
 ---
 
 # Codex Crew Setup
@@ -19,13 +19,17 @@ The relay lives in the codex-crew skill, normally next to this skill's folder: `
 npx skills add MungoHarvey/codex-claude-crew --skill codex-crew --agent codex -g
 ```
 
-## 2. Check Pi and OpenCode first
+## 2. Check the host runtime, then Pi and OpenCode
+
+The relay currently supports macOS and Linux only. Before invoking it, identify the current host. On macOS/Linux, verify Python 3.9+, `git` and `ps` are available. On Windows, do not assume that `python`/`python3` is a working interpreter just because `Get-Command` finds a WindowsApps alias: try `py -3 --version`, `python --version` and `python3 --version`, and report the actual launcher output/errors without printing environment secrets. Distinguish an absent interpreter (no usable launcher is installed) from an installed launcher that fails to start.
+
+If Python is genuinely absent, tell the user what was checked and offer to help install Python; wait for explicit confirmation before installing it or changing the machine. If a launcher is installed but fails to start, report the exact error and do not treat that as proof Python is absent or reinstall it automatically. On Windows, also explain that the relay does not currently support native Windows, so installing Windows Python alone will not make the relay work. Do not enable/configure WSL or try another environment as a workaround. Do not proceed to install a worker CLI until the relay host is supported and working. If the user needs Windows support, suggest raising an issue in the project repository and include the exact OS/runtime error they saw.
 
 ```bash
 python3 <relay> workers
 ```
 
-This makes no model call and uses no credits. It checks all supported worker CLIs; focus the setup decision on Pi and OpenCode. If the user names a Pi model, add `--pi-model <provider/model>` so Pi can check that provider's sign-in. Check `host.ok` before proceeding: if it is false, explain the host prerequisite and stop rather than installing a CLI that this relay cannot run. If the command errors before returning JSON, treat that as a relay/host prerequisite failure and stop; don't install a worker to work around it.
+Run this only after the host runtime is usable. It makes no model call and uses no credits. It checks all supported worker CLIs; focus the setup decision on Pi and OpenCode. If the user names a Pi model, add `--pi-model <provider/model>` so Pi can check that provider's sign-in. Check `host.ok` before proceeding: if it is false, explain the host prerequisite and stop rather than installing a CLI that this relay cannot run. If the command errors before returning JSON, diagnose whether Python is missing, a launcher failed, or the host is unsupported; report the exact error and ask the user how they want to proceed. Don't install a worker to work around a host/runtime failure.
 
 It prints JSON:
 

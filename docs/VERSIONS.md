@@ -13,7 +13,7 @@ The long-term goal is one Codex thread coordinating several Claude Code sessions
 
 - **Pi and OpenCode workers.** `--worker pi` and `--worker opencode` run the same review and implement modes, with the same run record, worktrees, resume, fork, background runs, cancellation and verification. Limits a worker cannot enforce are refused rather than recorded.
 
-- **Setup skill.** `codex-crew-setup` checks Pi and OpenCode first, prefers Pi when the user has no preference, and asks whether to install Pi or use OpenCode when Pi is missing but OpenCode is ready. It asks before any global install. `relay.py workers` verifies installed versions/profile support without a model call.
+- **Setup skill.** `codex-crew-setup` checks the supported host runtime before Pi and OpenCode, offers Python installation when Python is absent (with confirmation first), prefers Pi when the user has no preference, and asks whether to install Pi or use OpenCode when Pi is missing but OpenCode is ready. It asks before any global install. Native Windows is not supported; installing Windows Python alone will not fix this, and users who need Windows support are directed to raise an issue. `relay.py workers` verifies installed versions/profile support without a model call.
 - **Renamed to `codex-crew`.** Invoke it as `$codex-crew`. The state folder (`~/.codex-claude-crew`), the `CLAUDE_CREW_*` environment variables and the run record schema keep their old names, so existing runs and worktrees still work.
 
 ## Requirements
