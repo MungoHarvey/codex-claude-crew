@@ -1,0 +1,32 @@
+{
+  "skill_name": "codex-crew-setup",
+  "notes": "Run each case in an isolated sandbox whose PATH puts fake claude, pi and opencode CLIs first (tests/fixtures/fake_*.py); case 2 removes opencode from the sandbox. No model is called.",
+  "evals": [
+    {
+      "id": 1,
+      "name": "list-available-workers",
+      "prompt": "Which coding agents can I use with codex-crew on this machine?",
+      "expected_output": "A per-worker report from relay.py workers, with the default, and unchecked sign-in not presented as confirmed.",
+      "assertions": [
+        "relay.py workers was run (visible in transcript)",
+        "No relay run record exists (no paid live check without asking)",
+        "The final answer names claude, pi and opencode with a ready/not-ready status for each",
+        "The final answer names claude as the default",
+        "The final answer does not describe OpenCode's sign-in as confirmed"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "missing-opencode-install-advice",
+      "prompt": "I want to use OpenCode with codex-crew. Is it set up?",
+      "missing_workers": ["opencode"],
+      "expected_output": "The agent finds OpenCode missing and gives the install command without running it.",
+      "assertions": [
+        "relay.py workers or preflight --worker opencode was run",
+        "The final answer says OpenCode is not installed / not found",
+        "The final answer includes 'npm install -g opencode-ai'",
+        "No npm install command was executed (transcript)"
+      ]
+    }
+  ]
+}

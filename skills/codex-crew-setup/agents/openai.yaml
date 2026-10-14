@@ -1,0 +1,7 @@
+interface:
+  display_name: "Codex Crew Setup"
+  short_description: "Check which codex-crew workers this machine can run"
+  default_prompt: "Use $codex-crew-setup to check which of Claude Code, Pi and OpenCode I can use with codex-crew."
+
+policy:
+  allow_implicit_invocation: true

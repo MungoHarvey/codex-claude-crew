@@ -1,0 +1,56 @@
+{
+  "skill_name": "codex-crew",
+  "notes": "Run each case in an isolated sandbox whose PATH puts fake claude, pi and opencode CLIs first (tests/fixtures/fake_*.py), so no model is called. Grade from the relay's run records in $CLAUDE_CREW_HOME/runs and the fake CLIs' call logs, not only from the transcript.",
+  "evals": [
+    {
+      "id": 1,
+      "name": "claude-review-default-worker",
+      "prompt": "Use codex-crew to have Claude review src/calc.py in this repo for bugs. Don't change anything.",
+      "expected_output": "A Claude review run through relay.py, verified and reported with Claude's claims kept apart from what was confirmed.",
+      "assertions": [
+        "Exactly one relay run record exists with agent 'claude' and mode 'review'",
+        "No run used --worker pi or --worker opencode",
+        "The brief saved with the run names src/calc.py and has Goal and Scope sections",
+        "The run record's verification.verdict is confirmed, partial or rejected (relay.py verify was called)",
+        "The worker was never invoked directly: every fake claude call came from the relay (argv contains --restricted)",
+        "No file in the repo changed",
+        "The final answer separates what the worker claimed from what was verified"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "opencode-implement-with-check",
+      "prompt": "Ask OpenCode to add a guard so average([]) returns 0 instead of crashing, in a worktree, and have it run pytest. Then check its work.",
+      "expected_output": "An OpenCode implement run in a crew/ worktree with a scoped pytest rule, followed by the agent's own verification.",
+      "assertions": [
+        "A run record exists with agent 'opencode', mode 'implement' and a worktree branch starting 'crew/'",
+        "request.allow contains a Bash(pytest ...) rule and no broad Bash or Bash(*) rule",
+        "The OpenCode agent config passed to the fake contains a bash rule allowing pytest",
+        "relay.py verify was called for the run",
+        "The final answer gives the worktree path or branch",
+        "Nothing was committed or merged in the main checkout"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "pi-budget-cannot-be-enforced",
+      "prompt": "Have Pi review src/calc.py for division-by-zero risks, but cap it at $1 of spend.",
+      "expected_output": "The agent learns Pi cannot enforce a budget and says so. It either runs Pi bounded by a timeout and discloses that the cap was not enforced, or stops and offers alternatives (such as Claude, which can enforce a budget) before spending.",
+      "assertions": [
+        "No pi run record has request.max_budget_usd set (the cap is never recorded as if it held)",
+        "The final answer tells the user Pi cannot enforce a spending cap",
+        "Either a completed pi review was bounded with an explicit --timeout, or no pi run started and the answer offers the user alternatives before spending"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "small-fix-done-directly",
+      "prompt": "Fix the typo in README.md: 'maths' should be 'math'.",
+      "expected_output": "The agent edits README.md itself without delegating.",
+      "assertions": [
+        "No relay run record exists",
+        "README.md contains 'math helpers' and not 'maths helpers'"
+      ]
+    }
+  ]
+}

@@ -9,8 +9,18 @@
 
 The long-term goal is one Codex thread coordinating several Claude Code sessions, each in its own worktree.
 
+## Unreleased
+
+- **Pi and OpenCode workers.** `--worker pi` and `--worker opencode` run the same review and implement modes, with the same run record, worktrees, resume, fork, background runs, cancellation and verification. Limits a worker cannot enforce are refused rather than recorded.
+
+- **Setup skill.** `codex-crew-setup` and `relay.py workers` report which of Claude Code, Pi and OpenCode are installed, new enough and signed in, with install and sign-in hints, without a model call.
+- **Renamed to `codex-crew`.** Invoke it as `$codex-crew`. The state folder (`~/.codex-claude-crew`), the `CLAUDE_CREW_*` environment variables and the run record schema keep their old names, so existing runs and worktrees still work.
+
 ## Requirements
 
 - Codex (desktop app, CLI or IDE extension)
-- [Claude Code](https://code.claude.com/docs/en/getting-started) 2.1.259 or later, authenticated. The relay checks the required flags and refuses unsupported versions.
+- At least one authenticated worker CLI. The relay checks the required flags and refuses unsupported versions.
+  - [Claude Code](https://code.claude.com/docs/en/getting-started) 2.1.259 or later
+  - [Pi](https://github.com/earendil-works/pi) 1.2.0 or later (`npm install -g @earendil-works/pi-coding-agent`)
+  - [OpenCode](https://github.com/anomalyco/opencode) 1.19.0 or later (`npm install -g opencode-ai`)
 - Python 3.9+, git and `ps`, on macOS or Linux

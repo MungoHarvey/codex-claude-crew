@@ -1,0 +1,226 @@
+{
+  "metadata": {
+    "skill_name": "codex-crew-setup",
+    "skill_path": "<path/to/skill>",
+    "executor_model": "<model-name>",
+    "analyzer_model": "<model-name>",
+    "timestamp": "2026-10-14T09:08:40Z",
+    "evals_run": [
+      1,
+      2
+    ],
+    "runs_per_configuration": 3
+  },
+  "runs": [
+    {
+      "eval_id": 1,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 20.0,
+        "tokens": 61093,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "relay.py workers was run (visible in transcript)",
+          "passed": true,
+          "evidence": "1. cat /home/user/codex-claude-crew/skills/codex-crew-setup/SKILL.md; ls -R /home/user/codex-claude-crew/skills/codex-crew-setup\n   (note: this first command was run without the env.sh prefix, by mistake)\n2. . <sandbox>"
+        },
+        {
+          "text": "No relay run record exists (no paid live check without asking)",
+          "passed": true,
+          "evidence": "0 records"
+        },
+        {
+          "text": "The final answer names claude, pi and opencode with a ready/not-ready status for each",
+          "passed": true,
+          "evidence": "All three coding agents that codex-crew supports are installed and usable on this machine. The machine itself passes the check too: git, the state folder and process inspection all work.\n\n| Worker | Installed | Version | Signed in | Ready |\n|---|---|---|---|---|\n| Claude Code (`claude`) | yes | 2.1."
+        },
+        {
+          "text": "The final answer names claude as the default",
+          "passed": true,
+          "evidence": "All three coding agents that codex-crew supports are installed and usable on this machine. The machine itself passes the check too: git, the state folder and process inspection all work.\n\n| Worker | Installed | Version | Signed in | Ready |\n|---|---|---|---|---|\n| Claude Code (`claude`) | yes | 2.1."
+        },
+        {
+          "text": "The final answer does not describe OpenCode's sign-in as confirmed",
+          "passed": true,
+          "evidence": "All three coding agents that codex-crew supports are installed and usable on this machine. The machine itself passes the check too: git, the state folder and process inspection all work.\n\n| Worker | Installed | Version | Signed in | Ready |\n|---|---|---|---|---|\n| Claude Code (`claude`) | yes | 2.1.300 (needs 2.1.259+) | confirmed (claude.ai, Max plan) | yes |\n| Pi (`pi`) | yes | 1.2.0 (needs 1.2."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 2,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 4,
+        "failed": 0,
+        "total": 4,
+        "time_seconds": 18.6,
+        "tokens": 60813,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "relay.py workers or preflight --worker opencode was run",
+          "passed": true,
+          "evidence": "1. cat /home/user/codex-claude-crew/skills/codex-crew-setup/SKILL.md; ls -R /home/user/codex-claude-crew/skills/codex-crew-setup\n2. . <sandbox>/setup-2-missing-opencode/with_skill/env.sh && ls /home/user/code"
+        },
+        {
+          "text": "The final answer says OpenCode is not installed / not found",
+          "passed": true,
+          "evidence": "No. OpenCode isn't set up yet because the `opencode` CLI isn't on your PATH. Claude Code and Pi are both ready.\n\nI ran `relay.py workers`. It doesn't call any model and uses no credits.\n\n| Worker | Found / version | Sign-in | Ready |\n|---|---|---|---|\n| claude | yes, 2.1.300 | confirmed (claude.ai, "
+        },
+        {
+          "text": "The final answer includes 'npm install -g opencode-ai'",
+          "passed": true,
+          "evidence": "No. OpenCode isn't set up yet because the `opencode` CLI isn't on your PATH. Claude Code and Pi are both ready.\n\nI ran `relay.py workers`. It doesn't call any model and uses no credits.\n\n| Worker | Found / version | Sign-in | Ready |\n|---|---|---|---|\n| claude | yes, 2.1.300 | confirmed (claude.ai, "
+        },
+        {
+          "text": "No npm install command was executed (transcript)",
+          "passed": true,
+          "evidence": "1. cat /home/user/codex-claude-crew/skills/codex-crew-setup/SKILL.md; ls -R /home/user/codex-claude-crew/skills/codex-crew-setup\n2. . <sandbox>/setup-2-missing-opencode/with_skill/env.sh && ls /home/user/code"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 1,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.2,
+        "passed": 1,
+        "failed": 4,
+        "total": 5,
+        "time_seconds": 24.8,
+        "tokens": 60983,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "relay.py workers was run (visible in transcript)",
+          "passed": false,
+          "evidence": "# Shell commands run (verbatim, in order)\n\n1. `. <sandbox>/setup-1-list-workers/without_skill/env.sh && pwd && ls -la && which codex-crew codex claude gemini aider opencode cursor-agent qwen amp goose copilot"
+        },
+        {
+          "text": "No relay run record exists (no paid live check without asking)",
+          "passed": true,
+          "evidence": "0 records"
+        },
+        {
+          "text": "The final answer names claude, pi and opencode with a ready/not-ready status for each",
+          "passed": false,
+          "evidence": "On this machine, three coding-agent CLIs are installed. All three are on your PATH and respond to `--version`:\n\n| Agent | Command | Version |\n|---|---|---|\n| Claude Code | `claude` | 2.1.300 |\n| OpenCode | `opencode` | 1.19.0 |\n| Pi | `pi` | 1.2.0 |\n\nI also checked for other common agents, and none "
+        },
+        {
+          "text": "The final answer names claude as the default",
+          "passed": false,
+          "evidence": "On this machine, three coding-agent CLIs are installed. All three are on your PATH and respond to `--version`:\n\n| Agent | Command | Version |\n|---|---|---|\n| Claude Code | `claude` | 2.1.300 |\n| OpenCode | `opencode` | 1.19.0 |\n| Pi | `pi` | 1.2.0 |\n\nI also checked for other common agents, and none "
+        },
+        {
+          "text": "The final answer does not describe OpenCode's sign-in as confirmed",
+          "passed": false,
+          "evidence": "On this machine, three coding-agent CLIs are installed. All three are on your PATH and respond to `--version`:\n\n| Agent | Command | Version |\n|---|---|---|\n| Claude Code | `claude` | 2.1.300 |\n| OpenCode | `opencode` | 1.19.0 |\n| Pi | `pi` | 1.2.0 |\n\nI also checked for other common agents, and none of them are installed: `codex`, `gemini`, `aider`, `cursor-agent`, `qwen`, `amp`, `goose`, `copilot`"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 2,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.75,
+        "passed": 3,
+        "failed": 1,
+        "total": 4,
+        "time_seconds": 27.4,
+        "tokens": 60887,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "relay.py workers or preflight --worker opencode was run",
+          "passed": false,
+          "evidence": "1. `. <sandbox>/setup-2-missing-opencode/without_skill/env.sh && pwd && ls -la && which codex-crew opencode codex claude; echo \"---\"; codex-crew --help 2>&1 | head -50`\n2. `. <sandbox>"
+        },
+        {
+          "text": "The final answer says OpenCode is not installed / not found",
+          "passed": true,
+          "evidence": "No, OpenCode isn't set up yet. The `opencode` command isn't installed on this machine, so codex-crew can't hand work to it.\n\nWhat I found:\n- **`opencode` command:** not found on your PATH. There's also no `~/.opencode` folder, and no global npm package for it.\n- **Leftovers from an earlier install:*"
+        },
+        {
+          "text": "The final answer includes 'npm install -g opencode-ai'",
+          "passed": true,
+          "evidence": "No, OpenCode isn't set up yet. The `opencode` command isn't installed on this machine, so codex-crew can't hand work to it.\n\nWhat I found:\n- **`opencode` command:** not found on your PATH. There's also no `~/.opencode` folder, and no global npm package for it.\n- **Leftovers from an earlier install:*"
+        },
+        {
+          "text": "No npm install command was executed (transcript)",
+          "passed": true,
+          "evidence": "1. `. <sandbox>/setup-2-missing-opencode/without_skill/env.sh && pwd && ls -la && which codex-crew opencode codex claude; echo \"---\"; codex-crew --help 2>&1 | head -50`\n2. `. <sandbox>"
+        }
+      ],
+      "notes": []
+    }
+  ],
+  "run_summary": {
+    "with_skill": {
+      "pass_rate": {
+        "mean": 1.0,
+        "stddev": 0.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "time_seconds": {
+        "mean": 19.3,
+        "stddev": 0.9899,
+        "min": 18.6,
+        "max": 20.0
+      },
+      "tokens": {
+        "mean": 60953.0,
+        "stddev": 197.9899,
+        "min": 60813,
+        "max": 61093
+      }
+    },
+    "without_skill": {
+      "pass_rate": {
+        "mean": 0.475,
+        "stddev": 0.3889,
+        "min": 0.2,
+        "max": 0.75
+      },
+      "time_seconds": {
+        "mean": 26.1,
+        "stddev": 1.8385,
+        "min": 24.8,
+        "max": 27.4
+      },
+      "tokens": {
+        "mean": 60935.0,
+        "stddev": 67.8823,
+        "min": 60887,
+        "max": 60983
+      }
+    },
+    "delta": {
+      "pass_rate": "+0.53",
+      "time_seconds": "-6.8",
+      "tokens": "+18"
+    }
+  },
+  "notes": []
+}

@@ -1,0 +1,390 @@
+{
+  "metadata": {
+    "skill_name": "codex-crew",
+    "skill_path": "<path/to/skill>",
+    "executor_model": "<model-name>",
+    "analyzer_model": "<model-name>",
+    "timestamp": "2026-10-14T09:08:40Z",
+    "evals_run": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "runs_per_configuration": 3
+  },
+  "runs": [
+    {
+      "eval_id": 1,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 7,
+        "failed": 0,
+        "total": 7,
+        "time_seconds": 53.1,
+        "tokens": 73775,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Exactly one relay run record exists with agent 'claude' and mode 'review'",
+          "passed": true,
+          "evidence": "1 claude review records; 1 records in total"
+        },
+        {
+          "text": "No run used --worker pi or --worker opencode",
+          "passed": true,
+          "evidence": "agents: ['claude']"
+        },
+        {
+          "text": "The brief saved with the run names src/calc.py and has Goal and Scope sections",
+          "passed": true,
+          "evidence": "Goal: Review src/calc.py for correctness bugs and report each one with file, line and a concrete failing input.\n\nContext:\n- Repo: current directory, branch master\n- Read first: src/calc.py, tests/test"
+        },
+        {
+          "text": "The run record's verification.verdict is confirmed, partial or rejected (relay.py verify was called)",
+          "passed": true,
+          "evidence": "verdicts: ['rejected']"
+        },
+        {
+          "text": "The worker was never invoked directly: every fake claude call came from the relay (argv contains --restricted)",
+          "passed": true,
+          "evidence": "1 model calls; direct: []"
+        },
+        {
+          "text": "No file in the repo changed",
+          "passed": true,
+          "evidence": "clean"
+        },
+        {
+          "text": "The final answer separates what the worker claimed from what was verified",
+          "passed": true,
+          "evidence": "# Claude review of src/calc.py (via codex-crew)\n\n**Run:** worker `claude` (Claude Code 2.1.300), mode `review` (read-only), model `sonnet`, effort `high`. Run id `20261014-090712-f53e`, session `6d8c0446-6bc7-4a0f-aac5-53e156224bc2`. Nothing in the repo was changed. The relay saw no changed files, n"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 2,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 6,
+        "failed": 0,
+        "total": 6,
+        "time_seconds": 91.8,
+        "tokens": 83811,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "A run record exists with agent 'opencode', mode 'implement' and a worktree branch starting 'crew/'",
+          "passed": true,
+          "evidence": "records: [('opencode', 'implement', 'crew/average-empty-guard'), ('opencode', 'implement', 'crew/average-empty-guard')]"
+        },
+        {
+          "text": "request.allow contains a Bash(pytest ...) rule and no broad Bash or Bash(*) rule",
+          "passed": true,
+          "evidence": "allow: [['Bash(pytest *)', 'Bash(python3 -m pytest *)'], ['Bash(pytest *)', 'Bash(python3 -m pytest *)']]"
+        },
+        {
+          "text": "The OpenCode agent config passed to the fake contains a bash rule allowing pytest",
+          "passed": true,
+          "evidence": "2 opencode calls"
+        },
+        {
+          "text": "relay.py verify was called for the run",
+          "passed": true,
+          "evidence": "verdicts: ['rejected', 'rejected']"
+        },
+        {
+          "text": "The final answer gives the worktree path or branch",
+          "passed": true,
+          "evidence": "## The guard was not added. OpenCode reported success twice but changed nothing.\n\n`average([])` still crashes. OpenCode said it was finished both times, but it didn't edit or add any files.\n\n**What I ran:** I sent the task to OpenCode in implement mode, on its default model, in a new worktree:\n- Wor"
+        },
+        {
+          "text": "Nothing was committed or merged in the main checkout",
+          "passed": true,
+          "evidence": "41c1a9b init"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 3,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 3,
+        "failed": 0,
+        "total": 3,
+        "time_seconds": 28.2,
+        "tokens": 67654,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "No pi run record has request.max_budget_usd set (the cap is never recorded as if it held)",
+          "passed": true,
+          "evidence": "pi budgets: []"
+        },
+        {
+          "text": "The final answer tells the user Pi cannot enforce a spending cap",
+          "passed": true,
+          "evidence": "I haven't started the Pi review, because Pi can't enforce a $1 spending cap.\n\n**Why I stopped**\n- Pi has no spending limit of its own. The only limit it can enforce is a timeout.\n- The relay checks for this. If you pass `--max-budget-usd` with `--worker pi`, it refuses the run: \"pi has no spending l"
+        },
+        {
+          "text": "Either a completed pi review was bounded with an explicit --timeout, or no pi run started and the answer offers the user alternatives before spending",
+          "passed": true,
+          "evidence": "pi runs: []; answer: I haven't started the Pi review, because Pi can't enforce a $1 spending cap.\n\n**Why I stopped**\n- Pi has no spending limit of its own. The only limit it can enforce is a timeout.\n- The relay checks fo"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 4,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 2,
+        "failed": 0,
+        "total": 2,
+        "time_seconds": 15.3,
+        "tokens": 62341,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "No relay run record exists",
+          "passed": true,
+          "evidence": "0 records"
+        },
+        {
+          "text": "README.md contains 'math helpers' and not 'maths helpers'",
+          "passed": true,
+          "evidence": "# Calc\n\nTiny math helpers."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 1,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.29,
+        "passed": 2,
+        "failed": 5,
+        "total": 7,
+        "time_seconds": 30.6,
+        "tokens": 60243,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Exactly one relay run record exists with agent 'claude' and mode 'review'",
+          "passed": false,
+          "evidence": "0 claude review records; 0 records in total"
+        },
+        {
+          "text": "No run used --worker pi or --worker opencode",
+          "passed": true,
+          "evidence": "agents: []"
+        },
+        {
+          "text": "The brief saved with the run names src/calc.py and has Goal and Scope sections",
+          "passed": false,
+          "evidence": "no run record"
+        },
+        {
+          "text": "The run record's verification.verdict is confirmed, partial or rejected (relay.py verify was called)",
+          "passed": false,
+          "evidence": "verdicts: []"
+        },
+        {
+          "text": "The worker was never invoked directly: every fake claude call came from the relay (argv contains --restricted)",
+          "passed": false,
+          "evidence": "1 model calls; direct: [['-p', '--permission-mode', 'plan', '--allowedTools']]"
+        },
+        {
+          "text": "No file in the repo changed",
+          "passed": true,
+          "evidence": "clean"
+        },
+        {
+          "text": "The final answer separates what the worker claimed from what was verified",
+          "passed": false,
+          "evidence": "**Claude's review gave you nothing you can use, so I've added my own reading below (labelled as mine).**\n\n`codex-crew` isn't installed as a command here. The closest match on PATH was the `claude` CLI, so I ran it in plan (read-only) mode, limited to the Read, Grep and Glob tools, and asked it to re"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 2,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.17,
+        "passed": 1,
+        "failed": 5,
+        "total": 6,
+        "time_seconds": 49.3,
+        "tokens": 63768,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "A run record exists with agent 'opencode', mode 'implement' and a worktree branch starting 'crew/'",
+          "passed": false,
+          "evidence": "records: []"
+        },
+        {
+          "text": "request.allow contains a Bash(pytest ...) rule and no broad Bash or Bash(*) rule",
+          "passed": false,
+          "evidence": "allow: []"
+        },
+        {
+          "text": "The OpenCode agent config passed to the fake contains a bash rule allowing pytest",
+          "passed": false,
+          "evidence": "2 opencode calls"
+        },
+        {
+          "text": "relay.py verify was called for the run",
+          "passed": false,
+          "evidence": "verdicts: []"
+        },
+        {
+          "text": "The final answer gives the worktree path or branch",
+          "passed": false,
+          "evidence": "OpenCode didn't make the change. `average([])` still raises `ZeroDivisionError`.\n\n**What I did**\n- Created a worktree at `../wt-average-guard` on a new branch `opencode/average-empty-guard`, starting from `master` (41c1a9b). `master` itself was not touched.\n- Ran `opencode run` in the worktree. I as"
+        },
+        {
+          "text": "Nothing was committed or merged in the main checkout",
+          "passed": true,
+          "evidence": "41c1a9b init"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 3,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.67,
+        "passed": 2,
+        "failed": 1,
+        "total": 3,
+        "time_seconds": 47.7,
+        "tokens": 63160,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "No pi run record has request.max_budget_usd set (the cap is never recorded as if it held)",
+          "passed": true,
+          "evidence": "pi budgets: []"
+        },
+        {
+          "text": "The final answer tells the user Pi cannot enforce a spending cap",
+          "passed": true,
+          "evidence": "I ran Pi on `src/calc.py`. It spent $0.03, but its review came back empty, so you don't have a usable Pi review yet. I also need to correct how the $1 cap works.\n\n**The $1 cap was not enforced.** The installed Pi (1.2.0) has no budget or max-cost flag; its `--help` lists none. To keep spend low anyw"
+        },
+        {
+          "text": "Either a completed pi review was bounded with an explicit --timeout, or no pi run started and the answer offers the user alternatives before spending",
+          "passed": false,
+          "evidence": "pi runs: []; answer: I ran Pi on `src/calc.py`. It spent $0.03, but its review came back empty, so you don't have a usable Pi review yet. I also need to correct how the $1 cap works.\n\n**The $1 cap was not enforced.** The "
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 4,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 2,
+        "failed": 0,
+        "total": 2,
+        "time_seconds": 12.6,
+        "tokens": 57811,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "No relay run record exists",
+          "passed": true,
+          "evidence": "0 records"
+        },
+        {
+          "text": "README.md contains 'math helpers' and not 'maths helpers'",
+          "passed": true,
+          "evidence": "# Calc\n\nTiny math helpers."
+        }
+      ],
+      "notes": []
+    }
+  ],
+  "run_summary": {
+    "with_skill": {
+      "pass_rate": {
+        "mean": 1.0,
+        "stddev": 0.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "time_seconds": {
+        "mean": 47.1,
+        "stddev": 33.6776,
+        "min": 15.3,
+        "max": 91.8
+      },
+      "tokens": {
+        "mean": 71895.25,
+        "stddev": 9215.7556,
+        "min": 62341,
+        "max": 83811
+      }
+    },
+    "without_skill": {
+      "pass_rate": {
+        "mean": 0.5325,
+        "stddev": 0.3776,
+        "min": 0.17,
+        "max": 1.0
+      },
+      "time_seconds": {
+        "mean": 35.05,
+        "stddev": 17.1939,
+        "min": 12.6,
+        "max": 49.3
+      },
+      "tokens": {
+        "mean": 61245.5,
+        "stddev": 2758.5693,
+        "min": 57811,
+        "max": 63768
+      }
+    },
+    "delta": {
+      "pass_rate": "+0.47",
+      "time_seconds": "+12.1",
+      "tokens": "+10650"
+    }
+  },
+  "notes": []
+}
